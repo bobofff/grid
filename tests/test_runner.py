@@ -1,0 +1,71 @@
+import tempfile
+import unittest
+from pathlib import Path
+
+from grid_bot.config import GridConfig
+from grid_bot.models import EquitySnapshot
+from grid_bot.runner import GridRunner
+from grid_bot.state import RunnerState, StateStore, save_runner_state
+
+
+def config(state_file: str) -> GridConfig:
+    return GridConfig("BTCUSDT", 80, 120, 4, "arithmetic", 10, 2, 100, 1000,
+                      -0.20, 0.15, 0.10, 0.30, 0.08, state_file, 1, True,
+                      "binance_testnet", "key", "secret", True, 5000, True, True)
+
+
+class _Exchange:
+    def __init__(self):
+        self.actions = []
+
+    def verify_account(self):
+        self.actions.append("verify")
+
+    def cancel_all(self, symbol):
+        self.actions.append(f"cancel:{symbol}")
+
+    def close_all_positions(self, symbol):
+        self.actions.append(f"close:{symbol}")
+
+    def assert_clean_symbol(self):
+        self.actions.append("clean")
+
+    def mark_price(self):
+        return 100.0
+
+    def set_configured_leverage(self):
+        self.actions.append("leverage")
+
+    def equity_snapshot(self):
+        return EquitySnapshot(0, 0, 0, 0, equity_override=1000)
+
+    def submit_grid_order(self, _order):
+        return "order-id"
+
+    def create_listen_key(self):
+        return "listen-key"
+
+
+class _Stream:
+    def start(self):
+        pass
+
+    def stop(self):
+        pass
+
+
+class GridRunnerRecoveryTests(unittest.TestCase):
+    def test_terminal_incomplete_run_is_reconciled_before_new_grid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = str(Path(directory) / "state.json")
+            store = StateStore(state_file)
+            save_runner_state(store, RunnerState(phase="STOPPED:OPERATIONAL_FAILURE:INCOMPLETE"))
+            exchange = _Exchange()
+            runner = GridRunner(config(state_file), exchange)
+            runner.stream = _Stream()
+
+            runner.start()
+
+        self.assertEqual(exchange.actions[:4], ["verify", "cancel:BTCUSDT", "close:BTCUSDT", "clean"])
+        self.assertIn("leverage", exchange.actions)
+        self.assertEqual(runner.state.phase, "RUNNING")
