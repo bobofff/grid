@@ -5,7 +5,7 @@ from pathlib import Path
 from grid_bot.config import GridConfig
 from grid_bot.models import EquitySnapshot
 from grid_bot.runner import GridRunner
-from grid_bot.state import RunnerState, StateStore, save_runner_state
+from grid_bot.state import RunnerState, StateStore, load_runner_state, save_runner_state
 
 
 def config(state_file: str) -> GridConfig:
@@ -50,22 +50,39 @@ class _Stream:
     def start(self):
         pass
 
+    def wait_connected(self, timeout):
+        pass
+
     def stop(self):
         pass
 
 
 class GridRunnerRecoveryTests(unittest.TestCase):
-    def test_terminal_incomplete_run_is_reconciled_before_new_grid(self):
+    def test_terminal_risk_run_refuses_automatic_reentry(self):
         with tempfile.TemporaryDirectory() as directory:
             state_file = str(Path(directory) / "state.json")
             store = StateStore(state_file)
-            save_runner_state(store, RunnerState(phase="STOPPED:OPERATIONAL_FAILURE:INCOMPLETE"))
+            save_runner_state(store, RunnerState(phase="STOPPED:HARD_STOP_LOSS"))
+            exchange = _Exchange()
+            runner = GridRunner(config(state_file), exchange)
+            runner.stream = _Stream()
+
+            with self.assertRaisesRegex(RuntimeError, "manual reset required"):
+                runner.start()
+
+        self.assertEqual(exchange.actions, ["verify"])
+        self.assertEqual(runner.state.phase, "STOPPED:HARD_STOP_LOSS")
+
+    def test_new_grid_gets_a_durable_grid_run_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = str(Path(directory) / "state.json")
             exchange = _Exchange()
             runner = GridRunner(config(state_file), exchange)
             runner.stream = _Stream()
 
             runner.start()
 
-        self.assertEqual(exchange.actions[:4], ["verify", "cancel:BTCUSDT", "close:BTCUSDT", "clean"])
-        self.assertIn("leverage", exchange.actions)
-        self.assertEqual(runner.state.phase, "RUNNING")
+            persisted = StateStore(state_file)
+            self.assertIsNotNone(runner.state.grid_run_id)
+            self.assertEqual(len(runner.state.grid_run_id), 12)
+            self.assertEqual(runner.state.grid_run_id, load_runner_state(persisted).grid_run_id)

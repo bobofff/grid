@@ -8,8 +8,8 @@ from .config import GridConfig
 from .exchange import PaperExchange
 from .exchange import BinanceUsdmExchange
 from .journal import TradeJournal
-from .runner import GridRunner
-from .risk import ExitReason, RoiRiskManager
+from .runner import GridRunner, install_signal_handlers, restore_signal_handlers
+from .risk import ROI_EXIT_REASONS, RoiRiskManager
 from .strategy import StaticNeutralGrid
 from .state import StateStore
 
@@ -38,7 +38,14 @@ def run(config: GridConfig | None = None, journal: TradeJournal | None = None) -
             return
         if not config.runner_enabled:
             raise RuntimeError("Set RUNNER_ENABLED=true only when you explicitly want Testnet orders submitted")
-        GridRunner(config, exchange, journal).run_forever()
+        runner = GridRunner(config, exchange, journal)
+        # `docker stop` and `systemctl stop` send SIGTERM; without a handler the
+        # process dies mid-grid leaving orders and exposure in place.
+        previous_handlers = install_signal_handlers(runner)
+        try:
+            runner.run_forever()
+        finally:
+            restore_signal_handlers(previous_handlers)
         return
     strategy = StaticNeutralGrid(config)
     store = StateStore(config.state_file)
@@ -48,7 +55,9 @@ def run(config: GridConfig | None = None, journal: TradeJournal | None = None) -
     roi, reason = risk.evaluate(exchange.equity_snapshot())
     store.save_risk_state(risk.state)
     logging.info("seeded %d static grid orders; ROI=%.2f%%; risk=%s", len(exchange.orders), roi * 100, reason)
-    if reason is not ExitReason.NONE:
+    # Keep this second execution mode under the same strict flattening policy as
+    # GridRunner: only a configured ROI trigger may close an existing position.
+    if reason in ROI_EXIT_REASONS:
         exchange.cancel_all(config.symbol)
         exchange.close_all_positions(config.symbol)
 

@@ -1,4 +1,6 @@
 .env
+.env.backup*
+.venv/
 __pycache__/
 .pytest_cache/
 runtime/

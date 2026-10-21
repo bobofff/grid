@@ -5,8 +5,8 @@ from pathlib import Path
 import os
 
 
-def load_dotenv(path: str = ".env") -> None:
-    """Small dependency-free .env loader; existing environment values win."""
+def load_dotenv(path: str = ".env", *, override: bool = False) -> None:
+    """Small dependency-free .env loader."""
     file = Path(path)
     if not file.exists():
         return
@@ -17,7 +17,9 @@ def load_dotenv(path: str = ".env") -> None:
         key, separator, value = line.partition("=")
         if not separator:
             raise ValueError(f"Invalid .env line: {raw!r}")
-        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        name, parsed = key.strip(), value.strip().strip('"').strip("'")
+        if override or name not in os.environ:
+            os.environ[name] = parsed
 
 
 def _required(name: str) -> str:
@@ -55,8 +57,11 @@ class GridConfig:
     runner_enabled: bool
 
     @classmethod
-    def from_env(cls, path: str = ".env") -> "GridConfig":
-        load_dotenv(path)
+    def from_env(cls, path: str = ".env", *, prefer_file: bool = True) -> "GridConfig":
+        # PM2 preserves the environment captured when a process was first
+        # registered.  A later dashboard save must therefore win over those stale
+        # values; the project .env is the durable source of strategy parameters.
+        load_dotenv(path, override=prefer_file)
         config = cls(
             symbol=_required("SYMBOL"),
             lower_price=float(_required("GRID_LOWER_PRICE")),

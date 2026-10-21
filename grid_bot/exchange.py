@@ -31,6 +31,18 @@ class Exchange(ABC):
     @abstractmethod
     def equity_snapshot(self) -> EquitySnapshot: ...
 
+    @abstractmethod
+    def open_client_order_ids(self) -> set[str]:
+        """Client IDs of the orders this account currently has working."""
+
+    @abstractmethod
+    def order_status(self, client_order_id: str) -> str | None:
+        """Binance status for one client ID, or None when the order never existed."""
+
+    @abstractmethod
+    def can_submit_reduce_only(self, order: GridOrder) -> bool:
+        """Whether a close leg fits the current exchange-side close capacity."""
+
 
 class PaperExchange(Exchange):
     def __init__(self) -> None:
@@ -51,13 +63,30 @@ class PaperExchange(Exchange):
     def equity_snapshot(self) -> EquitySnapshot:
         return EquitySnapshot(0, 0, 0, 0)
 
+    def open_client_order_ids(self) -> set[str]:
+        return {order.client_order_id for order in self.orders}
+
+    def order_status(self, client_order_id: str) -> str | None:
+        return "NEW" if client_order_id in self.open_client_order_ids() else None
+
+    def can_submit_reduce_only(self, order: GridOrder) -> bool:
+        return True
+
 
 class BinanceApiError(RuntimeError):
-    pass
+    """A Binance request reached the exchange but was rejected."""
+
+    def __init__(self, message: str, code: int | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class BinanceTransportError(BinanceApiError):
     """A request did not reach Binance reliably and may be retried by the caller."""
+
+
+# Binance returns this when a client order ID has never been seen for the symbol.
+ORDER_NOT_FOUND_CODE = -2013
 
 
 class BinanceUsdmExchange(Exchange):
@@ -121,7 +150,10 @@ class BinanceUsdmExchange(Exchange):
                     with self._opener(request, timeout=10) as response:
                         payload = json.loads(response.read().decode())
                     if isinstance(payload, dict) and payload.get("code", 0) not in (0, 200):
-                        raise BinanceApiError(f"Binance API error {payload.get('code')}: {payload.get('msg')}")
+                        raise BinanceApiError(
+                            f"Binance API error {payload.get('code')}: {payload.get('msg')}",
+                            code=payload.get("code"),
+                        )
                     return payload
                 except HTTPError as error:
                     # A -1021 request was rejected before Binance acted on it, so it is
@@ -137,7 +169,8 @@ class BinanceUsdmExchange(Exchange):
                         retry_after_clock_sync = True
                         break
                     raise BinanceApiError(
-                        f"Binance API error: {method} {path}: HTTP {error.code} {error.reason}; {detail}"
+                        f"Binance API error: {method} {path}: HTTP {error.code} {error.reason}; {detail}",
+                        code=code,
                     ) from error
                 except (URLError, ssl.SSLError, TimeoutError) as error:
                     if attempt + 1 < attempts:
@@ -213,7 +246,7 @@ class BinanceUsdmExchange(Exchange):
     def _position_side(self, order: GridOrder) -> str:
         return "LONG" if order.purpose.value.endswith("LONG") else "SHORT"
 
-    def submit_grid_order(self, order: GridOrder) -> str:
+    def _order_quantity(self, order: GridOrder) -> Decimal:
         if self._symbol_filters is None:
             self._load_symbol_filters()
         assert self._symbol_filters is not None
@@ -226,6 +259,32 @@ class BinanceUsdmExchange(Exchange):
             raise BinanceApiError(
                 "ORDER_NOTIONAL_USDT becomes smaller than the symbol minimum notional after price/quantity rounding"
             )
+        return quantity
+
+    def can_submit_reduce_only(self, order: GridOrder) -> bool:
+        """Prevent Binance from expiring a close that exceeds hedge-side capacity."""
+        if not order.reduce_only:
+            return True
+        position_side = self._position_side(order)
+        positions = self._request("GET", "/fapi/v2/positionRisk", {"symbol": self.config.symbol}, signed=True)
+        position = next((item for item in positions if item.get("positionSide") == position_side), None)
+        available = abs(Decimal(str((position or {}).get("positionAmt", "0"))))
+        for pending in self.open_orders():
+            pending_side = str(pending.get("side", ""))
+            closes_side = ((position_side == "LONG" and pending_side == "SELL")
+                           or (position_side == "SHORT" and pending_side == "BUY"))
+            if pending.get("positionSide") != position_side or not closes_side:
+                continue
+            available -= max(Decimal("0"), Decimal(str(pending.get("origQty", "0")))
+                             - Decimal(str(pending.get("executedQty", "0"))))
+        return available >= self._order_quantity(order)
+
+    def submit_grid_order(self, order: GridOrder) -> str:
+        if self._symbol_filters is None:
+            self._load_symbol_filters()
+        assert self._symbol_filters is not None
+        price = self._round_down(Decimal(str(order.price)), self._symbol_filters["tick"])
+        quantity = self._order_quantity(order)
         # In Hedge Mode Binance uses positionSide for the separate legs; reduceOnly is
         # intentionally omitted because Binance rejects it in Hedge Mode.
         payload = self._request("POST", "/fapi/v1/order", {
@@ -245,11 +304,18 @@ class BinanceUsdmExchange(Exchange):
             amount = Decimal(position["positionAmt"])
             if not amount:
                 continue
-            side = "SELL" if position["positionSide"] == "LONG" else "BUY"
-            self._request("POST", "/fapi/v1/order", {
-                "symbol": symbol, "side": side, "positionSide": position["positionSide"], "type": "MARKET",
+            position_side = position["positionSide"]
+            # Hedge-mode amounts are naturally positive for LONG and negative for
+            # SHORT.  In one-way mode Binance uses BOTH, so its sign alone tells
+            # us which market side closes rather than increases the position.
+            side = "SELL" if (position_side == "LONG" or amount > 0) else "BUY"
+            params = {
+                "symbol": symbol, "side": side, "positionSide": position_side, "type": "MARKET",
                 "quantity": format(abs(amount), "f"), "newOrderRespType": "RESULT",
-            }, signed=True)
+            }
+            if position_side == "BOTH":
+                params["reduceOnly"] = "true"
+            self._request("POST", "/fapi/v1/order", params, signed=True)
 
     def equity_snapshot(self) -> EquitySnapshot:
         account = self._request("GET", "/fapi/v2/account", signed=True)
@@ -269,6 +335,47 @@ class BinanceUsdmExchange(Exchange):
     def open_orders(self) -> list[dict[str, Any]]:
         """Read outstanding orders for the configured symbol without mutating them."""
         return self._request("GET", "/fapi/v1/openOrders", {"symbol": self.config.symbol}, signed=True)
+
+    def income_history(self, start_time_ms: int) -> list[dict[str, Any]]:
+        """Read grid-period realised PnL, funding and commission income entries."""
+        return self._request("GET", "/fapi/v1/income", {
+            "symbol": self.config.symbol, "startTime": start_time_ms, "limit": 1000,
+        }, signed=True)
+
+    def open_client_order_ids(self) -> set[str]:
+        """Client IDs of the orders this account currently has working on the symbol."""
+        return {str(item["clientOrderId"]) for item in self.open_orders() if item.get("clientOrderId")}
+
+    def order_status(self, client_order_id: str) -> str | None:
+        """Resolve one of our client IDs, including orders that already finished.
+
+        Returns None only when Binance has never seen the ID, which is what makes a
+        lost submit response distinguishable from a genuinely rejected order.
+        """
+        try:
+            payload = self._request("GET", "/fapi/v1/order",
+                                    {"symbol": self.config.symbol,
+                                     "origClientOrderId": client_order_id}, signed=True)
+        except BinanceApiError as error:
+            if error.code == ORDER_NOT_FOUND_CODE:
+                return None
+            raise
+        return str(payload["status"])
+
+    def order_details(self, client_order_id: str) -> dict[str, Any] | None:
+        """Return Binance's terminal-order record for an operator recovery check.
+
+        This is read-only and deliberately returns the raw order fields needed to
+        prove that an expired leg has not traded before it can be approved.
+        """
+        try:
+            return self._request("GET", "/fapi/v1/order",
+                                 {"symbol": self.config.symbol,
+                                  "origClientOrderId": client_order_id}, signed=True)
+        except BinanceApiError as error:
+            if error.code == ORDER_NOT_FOUND_CODE:
+                return None
+            raise
 
     def assert_clean_symbol(self) -> None:
         """Prevent a grid from being started on top of manual/old bot exposure."""

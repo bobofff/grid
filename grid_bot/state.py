@@ -48,8 +48,21 @@ class StateStore:
 class RunnerState:
     peak_roi: float = float("-inf")
     baseline_account_equity: float | None = None
+    # Timestamp for the equity baseline.  It identifies one grid run across PM2
+    # restarts, so dashboard income totals never include an earlier grid run.
+    baseline_started_at: str | None = None
+    # Immutable identifier for one user-created grid.  Unlike a process ID it
+    # survives runner restarts and scopes audit/history records.
+    grid_run_id: str | None = None
     phase: str = "NEW"
     orders: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # Replacement legs held back to avoid crossing another one of this account's
+    # live orders at the same price.  They must survive a restart.
+    deferred_orders: list[dict[str, Any]] = field(default_factory=list)
+    # A generic Binance EXPIRED order is normally fail-closed.  This list is an
+    # explicit, one-time operator approval created by ``grid_bot.recover`` after
+    # it has checked the final exchange record.  It is consumed on reconciliation.
+    approved_expired_order_ids: list[str] = field(default_factory=list)
 
     def risk_state(self) -> RiskState:
         return RiskState(self.peak_roi)
@@ -64,7 +77,11 @@ def load_runner_state(store: StateStore) -> RunnerState:
             raise ValueError("state must be a JSON object")
         return RunnerState(peak_roi=float(data.get("peak_roi", float("-inf"))),
                            baseline_account_equity=data.get("baseline_account_equity"),
-                           phase=data.get("phase", "NEW"), orders=data.get("orders", {}))
+                           baseline_started_at=data.get("baseline_started_at"),
+                           grid_run_id=data.get("grid_run_id"),
+                           phase=data.get("phase", "NEW"), orders=data.get("orders", {}),
+                           deferred_orders=data.get("deferred_orders", []),
+                           approved_expired_order_ids=data.get("approved_expired_order_ids", []))
     except (OSError, json.JSONDecodeError, TypeError, ValueError) as error:
         # Do not silently reset a possibly live strategy: the operator must first
         # reconcile Binance orders and positions before replacing this state file.
