@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import ssl
 import time
 from typing import Any
@@ -85,32 +86,54 @@ class BinanceTransportError(BinanceApiError):
     """A request did not reach Binance reliably and may be retried by the caller."""
 
 
+class BinanceRateLimitError(BinanceApiError):
+    """Binance rejected the request because this IP has exhausted its quota."""
+
+    def __init__(self, message: str, code: int | None = None,
+                 retry_at_ms: int | None = None) -> None:
+        super().__init__(message, code)
+        self.retry_at_ms = retry_at_ms
+
+
+class BinanceTimestampError(BinanceApiError):
+    """A signed request still failed after its single clock-sync replay."""
+
+
 # Binance returns this when a client order ID has never been seen for the symbol.
 ORDER_NOT_FOUND_CODE = -2013
 
 
 class BinanceUsdmExchange(Exchange):
-    """USDⓈ-M Testnet adapter. It deliberately cannot use a production base URL."""
+    """USDⓈ-M Futures adapter for an explicitly selected Testnet or Mainnet account."""
 
-    BASE_URL = "https://testnet.binancefuture.com"
-    # Testnet occasionally serves /time and signed endpoints from nodes whose
-    # clocks disagree, or delays the /time response for seconds.  Binance rejects
-    # a timestamp even slightly in the future, while a 5-second recvWindow permits
-    # this deliberately older timestamp.
-    SIGNED_TIMESTAMP_SAFETY_MARGIN_MS = 3_000
+    TESTNET_BASE_URL = "https://testnet.binancefuture.com"
+    MAINNET_BASE_URL = "https://fapi.binance.com"
+    # Binance rejects timestamps that are even slightly ahead of its clock.  The
+    # clock offset is anchored to when the /time response is received, so it is
+    # already conservative with respect to response latency; retain only a small
+    # additional margin for local scheduling jitter.
+    SIGNED_TIMESTAMP_SAFETY_MARGIN_MS = 1_000
 
     def __init__(self, config, opener=urlopen) -> None:
-        if not config.binance_testnet:
-            raise ValueError("BinanceUsdmExchange is Testnet-only in this version")
+        execution_mode = getattr(config, "execution_mode", "binance_testnet")
+        if execution_mode not in {"binance_testnet", "binance_mainnet"}:
+            raise ValueError("BinanceUsdmExchange requires a Binance execution mode")
+        expected_testnet = execution_mode == "binance_testnet"
+        if config.binance_testnet != expected_testnet:
+            expected = "true" if expected_testnet else "false"
+            raise ValueError(f"{execution_mode} requires BINANCE_TESTNET={expected}")
         if not config.binance_api_key or not config.binance_api_secret:
-            raise ValueError("BINANCE_API_KEY and BINANCE_API_SECRET are required for Testnet")
+            raise ValueError("BINANCE_API_KEY and BINANCE_API_SECRET are required")
         self.config = config
+        self.execution_mode = execution_mode
+        self.is_testnet = expected_testnet
+        self.base_url = self.TESTNET_BASE_URL if self.is_testnet else self.MAINNET_BASE_URL
         self._opener = opener
         self._symbol_filters: dict[str, Decimal] | None = None
         self._server_time_offset_ms = 0
 
     def sync_server_time(self) -> None:
-        """Align signed-request timestamps with Binance Testnet's clock."""
+        """Align signed-request timestamps with the selected Binance environment."""
         started_at_ms = int(time.time() * 1000)
         data = self._request("GET", "/fapi/v1/time")
         finished_at_ms = int(time.time() * 1000)
@@ -118,8 +141,14 @@ class BinanceUsdmExchange(Exchange):
             server_time_ms = int(data["serverTime"])
         except (KeyError, TypeError, ValueError) as error:
             raise BinanceApiError("Binance time endpoint returned an invalid serverTime") from error
-        self._server_time_offset_ms = server_time_ms - ((started_at_ms + finished_at_ms) // 2)
-        logging.info("Binance Testnet clock synchronized (offset=%d ms)", self._server_time_offset_ms)
+        # Do not use the midpoint of a request with an asymmetric or delayed
+        # response: it can produce a positive offset and a timestamp in Binance's
+        # future.  Referencing the receive time instead makes the next timestamp
+        # no newer than the server time observed by this response.
+        self._server_time_offset_ms = server_time_ms - finished_at_ms
+        logging.info("Binance %s clock synchronized (offset=%d ms, rtt=%d ms)",
+                     "Testnet" if self.is_testnet else "Mainnet", self._server_time_offset_ms,
+                     finished_at_ms - started_at_ms)
 
     def _build_request(self, method: str, path: str, params: dict[str, Any] | None,
                        signed: bool) -> Request:
@@ -133,7 +162,7 @@ class BinanceUsdmExchange(Exchange):
                 self.config.binance_api_secret.encode(), query.encode(), hashlib.sha256
             ).hexdigest()
         query = urlencode(values)
-        url = f"{self.BASE_URL}{path}" + (f"?{query}" if query else "")
+        url = f"{self.base_url}{path}" + (f"?{query}" if query else "")
         return Request(url, method=method, headers={"X-MBX-APIKEY": self.config.binance_api_key})
 
     def _request(self, method: str, path: str, params: dict[str, Any] | None = None,
@@ -142,7 +171,9 @@ class BinanceUsdmExchange(Exchange):
         # used here are safe to repeat, so give transient Testnet TLS/socket faults
         # time to clear without turning a momentary outage into a stopped bot.
         attempts = 5 if method in {"GET", "PUT", "DELETE"} else 1
-        for timestamp_attempt in range(3 if signed else 1):
+        # One clock sync/replay is enough. More retries only amplify request volume
+        # when a Testnet node is unhealthy or the IP is already being throttled.
+        for timestamp_attempt in range(2 if signed else 1):
             retry_after_clock_sync = False
             for attempt in range(attempts):
                 request = self._build_request(method, path, params, signed)
@@ -160,14 +191,27 @@ class BinanceUsdmExchange(Exchange):
                     # safe to synchronize the clock and replay it, even for writes.
                     try:
                         detail = error.read().decode("utf-8", errors="replace").strip()
-                        code = json.loads(detail).get("code")
+                        payload = json.loads(detail)
+                        code = payload.get("code")
                     except (OSError, ValueError):
-                        detail, code = "<response body unavailable>", None
-                    if signed and code == -1021 and timestamp_attempt < 2:
+                        detail, payload, code = "<response body unavailable>", {}, None
+                    if code == -1003:
+                        match = re.search(r"banned until (\d+)", str(payload.get("msg", "")))
+                        retry_at_ms = int(match.group(1)) if match else None
+                        raise BinanceRateLimitError(
+                            f"Binance API rate limit: {method} {path}: HTTP {error.code}; {detail}",
+                            code=code, retry_at_ms=retry_at_ms,
+                        ) from error
+                    if signed and code == -1021 and timestamp_attempt < 1:
                         logging.warning("Binance rejected request timestamp; synchronizing clock and retrying")
                         self.sync_server_time()
                         retry_after_clock_sync = True
                         break
+                    if signed and code == -1021:
+                        raise BinanceTimestampError(
+                            f"Binance clock synchronization failed: {method} {path}; {detail}",
+                            code=code,
+                        ) from error
                     raise BinanceApiError(
                         f"Binance API error: {method} {path}: HTTP {error.code} {error.reason}; {detail}",
                         code=code,
@@ -198,7 +242,7 @@ class BinanceUsdmExchange(Exchange):
             self._load_symbol_filters()
 
     def set_configured_leverage(self) -> None:
-        """Set the symbol's Testnet leverage and confirm Binance accepted it."""
+        """Set the symbol leverage and confirm Binance accepted it."""
         payload = self._request("POST", "/fapi/v1/leverage", {
             "symbol": self.config.symbol,
             "leverage": self.config.leverage,
@@ -211,7 +255,8 @@ class BinanceUsdmExchange(Exchange):
             raise BinanceApiError(
                 f"Binance applied {actual_leverage}x leverage instead of configured {self.config.leverage}x"
             )
-        logging.info("Binance Testnet leverage set to %dx for %s", actual_leverage, self.config.symbol)
+        logging.info("Binance %s leverage set to %dx for %s",
+                     "Testnet" if self.is_testnet else "Mainnet", actual_leverage, self.config.symbol)
 
     def _load_symbol_filters(self) -> None:
         data = self._request("GET", "/fapi/v1/exchangeInfo")
@@ -233,7 +278,7 @@ class BinanceUsdmExchange(Exchange):
         }
 
     def symbol_order_rules(self) -> dict[str, Decimal]:
-        """Return active Testnet symbol constraints used to size a grid."""
+        """Return active symbol constraints used to size a grid."""
         if self._symbol_filters is None:
             self._load_symbol_filters()
         assert self._symbol_filters is not None
@@ -384,6 +429,20 @@ class BinanceUsdmExchange(Exchange):
             raise BinanceApiError(f"{self.config.symbol} has existing open orders; cancel/reconcile them before starting")
         if self.positions():
             raise BinanceApiError(f"{self.config.symbol} has an existing position; close it before starting")
+
+    def assert_starting_capital_available(self) -> None:
+        """Refuse a new grid when its declared capital exceeds available USDT margin."""
+        account = self._request("GET", "/fapi/v2/account", signed=True)
+        try:
+            available = Decimal(str(account["availableBalance"]))
+        except (KeyError, TypeError, ValueError, ArithmeticError) as error:
+            raise BinanceApiError("Binance account endpoint returned an invalid availableBalance") from error
+        required = Decimal(str(self.config.initial_capital_usdt))
+        if available < required:
+            raise BinanceApiError(
+                f"Available margin {available} USDT is below INITIAL_CAPITAL_USDT {required}; "
+                "reduce INITIAL_CAPITAL_USDT or transfer funds before starting"
+            )
 
     def create_listen_key(self) -> str:
         return self._request("POST", "/fapi/v1/listenKey")["listenKey"]

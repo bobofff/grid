@@ -32,6 +32,7 @@ CONFIG_DEFAULTS: dict[str, Any] = {
     "loop_interval_seconds": 0.01, "dry_run": False, "execution_mode": "binance_testnet",
     "binance_api_key": "key", "binance_api_secret": "secret", "binance_testnet": True,
     "binance_recv_window": 5000, "binance_hedge_mode_required": True, "runner_enabled": True,
+    "live_trading_confirmation": "",
 }
 
 
@@ -199,6 +200,9 @@ class ScriptedExchange(Exchange):
 
     def assert_clean_symbol(self) -> None:
         self._record("assert_clean_symbol")
+
+    def assert_starting_capital_available(self) -> None:
+        self._record("assert_starting_capital_available")
         if self.live_orders:
             raise BinanceApiError(f"{len(self.live_orders)} existing open order(s)")
         if self.position:

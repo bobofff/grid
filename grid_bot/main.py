@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+from datetime import date, datetime
 from pathlib import Path
 import traceback
+from zoneinfo import ZoneInfo
 
 from .config import GridConfig
 from .exchange import PaperExchange
@@ -14,30 +16,69 @@ from .strategy import StaticNeutralGrid
 from .state import StateStore
 
 
-LOG_FILE = Path("runtime/grid_bot.log")
+LOG_DIRECTORY = Path("runtime")
+LOG_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+class DailyFileHandler(logging.FileHandler):
+    """Append to one application log per local calendar day.
+
+    PM2 keeps the process alive across midnight, so choosing a dated path only at
+    startup would still let a single file grow indefinitely.  Reopen lazily on
+    the first record of each new day instead.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.current_day: date | None = None
+        super().__init__(self._path_for_today(), encoding="utf-8", delay=True)
+
+    def _path_for_today(self) -> Path:
+        return self.directory / f"grid_bot-{self._today():%Y-%m-%d}.log"
+
+    @staticmethod
+    def _today() -> date:
+        return datetime.now(LOG_TIMEZONE).date()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        today = self._today()
+        if self.current_day != today:
+            self.acquire()
+            try:
+                if self.current_day != today:
+                    if self.stream is not None:
+                        self.stream.flush()
+                        self.stream.close()
+                        self.stream = None
+                    self.baseFilename = str(self._path_for_today())
+                    self.current_day = today
+            finally:
+                self.release()
+        super().emit(record)
 
 
 def configure_logging() -> None:
-    """Write the same operational and error logs to the terminal and a local file."""
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    """Write operational and error logs to the terminal and one dated local file."""
+    LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE, encoding="utf-8")],
+        handlers=[logging.StreamHandler(), DailyFileHandler(LOG_DIRECTORY)],
     )
 
 
 def run(config: GridConfig | None = None, journal: TradeJournal | None = None) -> None:
     config = config or GridConfig.from_env()
     exchange = PaperExchange() if config.execution_mode == "paper" else BinanceUsdmExchange(config)
-    if config.execution_mode == "binance_testnet":
+    if config.execution_mode in {"binance_testnet", "binance_mainnet"}:
         exchange.verify_account()
-        logging.info("Binance Testnet verified; mark price=%.8f", exchange.mark_price())
+        environment = "Testnet" if config.execution_mode == "binance_testnet" else "Mainnet"
+        logging.info("Binance %s verified; mark price=%.8f", environment, exchange.mark_price())
         if config.dry_run:
-            logging.info("DRY_RUN=true: Testnet verification complete; no orders submitted")
+            logging.info("DRY_RUN=true: Binance %s verification complete; no orders submitted", environment)
             return
         if not config.runner_enabled:
-            raise RuntimeError("Set RUNNER_ENABLED=true only when you explicitly want Testnet orders submitted")
+            raise RuntimeError("Set RUNNER_ENABLED=true only when you explicitly want orders submitted")
         runner = GridRunner(config, exchange, journal)
         # `docker stop` and `systemctl stop` send SIGTERM; without a handler the
         # process dies mid-grid leaving orders and exposure in place.

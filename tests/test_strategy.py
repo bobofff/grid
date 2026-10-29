@@ -8,7 +8,7 @@ from grid_bot.strategy import StaticNeutralGrid
 def config() -> GridConfig:
     return GridConfig("BTCUSDT", 90, 110, 4, "arithmetic", 10, 2, 100, 1000,
                       -0.20, 0.15, 0.10, 0.30, 0.08, "runtime/state.json", 1, True,
-                      "paper", "", "", True, 5000, True, False)
+                      "paper", "", "", True, 5000, True, False, "")
 
 
 class StaticNeutralGridTests(unittest.TestCase):

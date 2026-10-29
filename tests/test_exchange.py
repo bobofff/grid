@@ -8,7 +8,12 @@ from unittest.mock import patch
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 
-from grid_bot.exchange import BinanceApiError, BinanceUsdmExchange
+from grid_bot.exchange import (
+    BinanceApiError,
+    BinanceRateLimitError,
+    BinanceTimestampError,
+    BinanceUsdmExchange,
+)
 from grid_bot.models import GridOrder, Purpose, Side
 
 
@@ -27,6 +32,37 @@ class _Response:
 
 
 class ExchangeRequestTests(unittest.TestCase):
+    def test_mainnet_uses_the_production_rest_endpoint(self):
+        config = SimpleNamespace(execution_mode="binance_mainnet", binance_testnet=False,
+                                 binance_api_key="key", binance_api_secret="secret",
+                                 binance_recv_window=5000, symbol="BTCUSDT")
+        exchange = BinanceUsdmExchange(config, opener=lambda *_args, **_kwargs: _Response())
+
+        request = exchange._build_request("GET", "/fapi/v1/premiumIndex", {"symbol": "BTCUSDT"}, False)
+
+        self.assertTrue(request.full_url.startswith("https://fapi.binance.com/fapi/v1/premiumIndex"))
+        self.assertFalse(exchange.is_testnet)
+
+    def test_rejects_mode_and_testnet_flag_mismatch(self):
+        config = SimpleNamespace(execution_mode="binance_mainnet", binance_testnet=True,
+                                 binance_api_key="key", binance_api_secret="secret",
+                                 binance_recv_window=5000, symbol="BTCUSDT")
+
+        with self.assertRaisesRegex(ValueError, "BINANCE_TESTNET=false"):
+            BinanceUsdmExchange(config)
+
+    def test_rejects_new_grid_when_available_margin_is_too_small(self):
+        config = SimpleNamespace(execution_mode="binance_mainnet", binance_testnet=False,
+                                 binance_api_key="key", binance_api_secret="secret",
+                                 binance_recv_window=5000, symbol="BTCUSDT",
+                                 initial_capital_usdt=1000)
+        exchange = BinanceUsdmExchange(config, opener=lambda *_args, **_kwargs: _Response({
+            "availableBalance": "99.89",
+        }))
+
+        with self.assertRaisesRegex(BinanceApiError, "Available margin 99.89 USDT"):
+            exchange.assert_starting_capital_available()
+
     def test_retries_transient_read_error(self):
         calls = 0
 
@@ -142,10 +178,40 @@ class ExchangeRequestTests(unittest.TestCase):
 
         account_requests = [item for item in requests if urlparse(item.full_url).path == "/fapi/v2/account"]
         self.assertEqual(len(account_requests), 2)
-        self.assertEqual(parse_qs(urlparse(account_requests[0].full_url).query)["timestamp"], ["97000"])
-        self.assertEqual(parse_qs(urlparse(account_requests[1].full_url).query)["timestamp"], ["99000"])
+        self.assertEqual(parse_qs(urlparse(account_requests[0].full_url).query)["timestamp"], ["99000"])
+        self.assertEqual(parse_qs(urlparse(account_requests[1].full_url).query)["timestamp"], ["101000"])
 
-    def test_retries_timestamp_rejection_after_two_clock_syncs(self):
+    def test_clock_sync_uses_response_receive_time_to_avoid_future_timestamp(self):
+        config = SimpleNamespace(binance_testnet=True, binance_api_key="key",
+                                 binance_api_secret="secret", binance_recv_window=10000,
+                                 symbol="BTCUSDT")
+        exchange = BinanceUsdmExchange(config, opener=lambda *_args, **_kwargs: _Response({
+            "serverTime": 100050,
+        }))
+
+        with patch("grid_bot.exchange.time.time", side_effect=[100.000, 100.120]):
+            exchange.sync_server_time()
+
+        self.assertEqual(exchange._server_time_offset_ms, -70)
+
+    def test_rate_limit_captures_binance_ban_deadline(self):
+        def opener(request, **_kwargs):
+            raise HTTPError(request.full_url, 418, "I'm a teapot", None, BytesIO(
+                b'{"code":-1003,"msg":"Way too many requests; IP banned until 1234567890123."}'
+            ))
+
+        config = SimpleNamespace(binance_testnet=True, binance_api_key="key",
+                                 binance_api_secret="secret", binance_recv_window=10000,
+                                 symbol="BTCUSDT")
+        exchange = BinanceUsdmExchange(config, opener=opener)
+
+        with self.assertRaises(BinanceRateLimitError) as caught:
+            exchange.equity_snapshot()
+
+        self.assertEqual(caught.exception.code, -1003)
+        self.assertEqual(caught.exception.retry_at_ms, 1234567890123)
+
+    def test_stops_timestamp_replays_after_one_clock_sync(self):
         requests = []
 
         def opener(request, **_kwargs):
@@ -163,7 +229,8 @@ class ExchangeRequestTests(unittest.TestCase):
                                  symbol="BTCUSDT")
         exchange = BinanceUsdmExchange(config, opener=opener)
         with patch("grid_bot.exchange.time.time", return_value=100.0):
-            self.assertEqual(exchange.equity_snapshot().equity(0), 123.45)
+            with self.assertRaisesRegex(BinanceTimestampError, "Timestamp outside recvWindow"):
+                exchange.equity_snapshot()
 
         account_requests = [item for item in requests if urlparse(item.full_url).path == "/fapi/v2/account"]
-        self.assertEqual(len(account_requests), 3)
+        self.assertEqual(len(account_requests), 2)

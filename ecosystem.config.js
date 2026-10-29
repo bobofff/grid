@@ -47,6 +47,9 @@ module.exports = {
       instances: 1,
 
       autorestart: true,
+      // A deliberate, fail-closed pause (including Binance 429/418) exits with
+      // code 0. Keep it stopped until an operator has reviewed the exchange.
+      stop_exit_codes: [0],
       exp_backoff_restart_delay: 5000,
       min_uptime: 60000,
       max_restarts: 10,

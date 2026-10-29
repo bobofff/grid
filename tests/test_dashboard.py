@@ -1,11 +1,15 @@
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import grid_bot.dashboard as dashboard
 from grid_bot.dashboard import exit_grid, performance_snapshot, strategy_health_snapshot
+from grid_bot.journal import TradeJournal
+from grid_bot.models import GridOrder, Purpose, Side
 from grid_bot.state import RunnerState, StateStore, load_runner_state, save_runner_state
 
 
@@ -32,6 +36,42 @@ class PerformanceSnapshotTests(unittest.TestCase):
         self.assertIsNotNone(snapshot["annualized_roi"])
 
 
+class FundingPlanTests(unittest.TestCase):
+    def test_minimum_margin_accounts_for_equal_order_allocation(self):
+        class Strategy:
+            def initial_orders(self):
+                return [SimpleNamespace(price=100.0), SimpleNamespace(price=90.0)]
+
+        rules = {"step": Decimal("0.1"), "min_qty": Decimal("0.1"),
+                 "min_notional": Decimal("10"), "tick": Decimal("0.1")}
+        insufficient = dashboard.funding_plan(
+            SimpleNamespace(initial_capital_usdt=6.0, leverage=5), Strategy(), rules)
+        sufficient = dashboard.funding_plan(
+            SimpleNamespace(initial_capital_usdt=7.2, leverage=5), Strategy(), rules)
+
+        # The lower-priced leg needs 0.2 units (18 USDT), so each of both legs
+        # needs an 18 USDT allocation: 18 * 2 / 5 = 7.2 USDT collateral.
+        self.assertEqual(insufficient["minimum_margin_usdt"], 7.2)
+        self.assertFalse(insufficient["sufficient"])
+        self.assertTrue(sufficient["sufficient"])
+
+
+class GridRunTimelineTests(unittest.TestCase):
+    def test_submission_confirmation_is_presented_as_new(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = TradeJournal(str(Path(directory) / "events.sqlite3"))
+            order = GridOrder(0, 80.0, Side.BUY, Purpose.OPEN_LONG, False, 0,
+                              client_order_id="grid-order")
+            journal.record_order("SUBMIT_INTENT", order, grid_run_id="run")
+            journal.record_order("SUBMIT_CONFIRMED", order, binance_order_id="123",
+                                 grid_run_id="run")
+
+            timeline = journal.grid_run_orders("run")
+
+        self.assertEqual(timeline[0]["status"], "NEW")
+        self.assertEqual(timeline[0]["binance_order_id"], "123")
+
+
 class ExitGridTests(unittest.TestCase):
     def test_stops_then_cancels_flattens_and_locks_the_grid(self):
         class FakeExchange:
@@ -49,6 +89,9 @@ class ExitGridTests(unittest.TestCase):
 
             def assert_clean_symbol(self):
                 self.calls.append("clean")
+
+            def assert_starting_capital_available(self):
+                self.calls.append("capital")
 
         with tempfile.TemporaryDirectory() as directory:
             state_file = str(Path(directory) / "state.json")
@@ -83,6 +126,21 @@ class ExitGridTests(unittest.TestCase):
 
 
 class StrategyHealthTests(unittest.TestCase):
+    def test_flags_missing_local_strategy_order_from_binance_book(self):
+        state = RunnerState(phase="RUNNING", orders={
+            "g-run-one": {"purpose": "OPEN_LONG", "side": "BUY"},
+            "g-run-two": {"purpose": "OPEN_LONG", "side": "BUY"},
+        })
+        snapshot = strategy_health_snapshot(
+            SimpleNamespace(), state, [],
+            [{"client_id": "g-run-one", "position_side": "LONG", "side": "BUY"}],
+            {"status": "online"},
+        )
+
+        self.assertEqual(snapshot["level"], "critical")
+        self.assertEqual(snapshot["live_strategy_order_count"], 1)
+        self.assertIn("策略订单与 Binance 挂单不一致", [item["title"] for item in snapshot["checks"]])
+
     def test_flags_a_deferred_close_for_an_open_short(self):
         state = RunnerState(phase="RUNNING", orders={"entry": {}}, deferred_orders=[{
             "price": 106.0, "side": "BUY", "purpose": "CLOSE_SHORT", "reduce_only": True,
@@ -116,4 +174,24 @@ class StrategyHealthTests(unittest.TestCase):
         )
 
         self.assertEqual(snapshot["level"], "ok")
+
+
+class StatusCacheTests(unittest.TestCase):
+    def setUp(self):
+        dashboard.invalidate_status_cache()
+        self.addCleanup(dashboard.invalidate_status_cache)
+
+    def test_shares_a_paper_status_snapshot_until_invalidated(self):
+        config = SimpleNamespace(execution_mode="paper", dry_run=True)
+        with patch("grid_bot.dashboard.GridConfig.from_env", return_value=config) as from_env:
+            first = dashboard.status_snapshot()
+            second = dashboard.status_snapshot()
+
+        self.assertIs(first, second)
+        from_env.assert_called_once()
+
+        dashboard.invalidate_status_cache()
+        with patch("grid_bot.dashboard.GridConfig.from_env", return_value=config) as from_env:
+            dashboard.status_snapshot()
+        from_env.assert_called_once()
 

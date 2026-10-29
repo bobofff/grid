@@ -1,17 +1,19 @@
 import tempfile
 import unittest
 from pathlib import Path
+from queue import Queue
+from types import SimpleNamespace
 
 from grid_bot.config import GridConfig
 from grid_bot.models import EquitySnapshot
-from grid_bot.runner import GridRunner
+from grid_bot.runner import BinanceUserStream, GridRunner
 from grid_bot.state import RunnerState, StateStore, load_runner_state, save_runner_state
 
 
 def config(state_file: str) -> GridConfig:
     return GridConfig("BTCUSDT", 80, 120, 4, "arithmetic", 10, 2, 100, 1000,
                       -0.20, 0.15, 0.10, 0.30, 0.08, state_file, 1, True,
-                      "binance_testnet", "key", "secret", True, 5000, True, True)
+                      "binance_testnet", "key", "secret", True, 5000, True, True, "")
 
 
 class _Exchange:
@@ -29,6 +31,9 @@ class _Exchange:
 
     def assert_clean_symbol(self):
         self.actions.append("clean")
+
+    def assert_starting_capital_available(self):
+        self.actions.append("capital")
 
     def mark_price(self):
         return 100.0
@@ -58,6 +63,11 @@ class _Stream:
 
 
 class GridRunnerRecoveryTests(unittest.TestCase):
+    def test_user_stream_selects_mainnet_websocket_endpoint(self):
+        stream = BinanceUserStream(SimpleNamespace(is_testnet=False), Queue())
+
+        self.assertEqual(stream.url_template, "wss://fstream.binance.com/ws/{}")
+
     def test_terminal_risk_run_refuses_automatic_reentry(self):
         with tempfile.TemporaryDirectory() as directory:
             state_file = str(Path(directory) / "state.json")

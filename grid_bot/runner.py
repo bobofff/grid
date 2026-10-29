@@ -1,4 +1,4 @@
-"""Long-running Binance Futures Testnet grid executor.
+"""Long-running Binance USDⓈ-M Futures grid executor.
 
 It is deliberately gated by both DRY_RUN=false and RUNNER_ENABLED=true. The user
 stream is the source of truth for filled orders; state is persisted before every
@@ -26,7 +26,13 @@ from uuid import uuid4
 import websocket
 
 from .config import GridConfig
-from .exchange import BinanceApiError, BinanceTransportError, BinanceUsdmExchange
+from .exchange import (
+    BinanceApiError,
+    BinanceRateLimitError,
+    BinanceTimestampError,
+    BinanceTransportError,
+    BinanceUsdmExchange,
+)
 from .journal import TradeJournal
 from .models import EquitySnapshot, GridOrder, Purpose, Side
 from .risk import ExitReason, ROI_EXIT_REASONS, RoiRiskManager
@@ -56,12 +62,14 @@ class BinanceUserStream:
     quiet while the REST loop keeps trading on stale knowledge.
     """
 
-    URL = "wss://stream.binancefuture.com/ws/{}"
+    TESTNET_URL = "wss://stream.binancefuture.com/ws/{}"
+    MAINNET_URL = "wss://fstream.binance.com/ws/{}"
     LISTEN_KEY_REFRESH_SECONDS = 20 * 60
     RECONNECT_DELAY_SECONDS = 2
 
     def __init__(self, exchange: BinanceUsdmExchange, events: Queue[dict[str, Any]]) -> None:
         self.exchange, self.events = exchange, events
+        self.url_template = self.TESTNET_URL if getattr(exchange, "is_testnet", True) else self.MAINNET_URL
         self.stop_event = Event()
         self.thread: Thread | None = None
         self.keepalive_thread: Thread | None = None
@@ -129,7 +137,7 @@ class BinanceUserStream:
             if not listen_key:
                 self.stop_event.wait(self.RECONNECT_DELAY_SECONDS)
                 continue
-            app = websocket.WebSocketApp(self.URL.format(listen_key),
+            app = websocket.WebSocketApp(self.url_template.format(listen_key),
                                          on_message=on_message, on_error=on_error,
                                          on_open=on_open)
             self._app = app
@@ -190,6 +198,11 @@ def restore_signal_handlers(previous: dict[int, Any]) -> None:
 class GridRunner:
     # How long to wait for the user stream before refusing to trade blind.
     STREAM_CONNECT_TIMEOUT_SECONDS = 30.0
+    # A short WebSocket outage can reconnect between two loop iterations.  Do not
+    # rely solely on observing its disconnected flag: periodically reconcile the
+    # exchange book so a missed fill is repaired even when that transition was
+    # missed locally.
+    PERIODIC_RECONCILE_INTERVAL_SECONDS = 30.0
 
     def __init__(self, config: GridConfig, exchange: BinanceUsdmExchange,
                  journal: TradeJournal | None = None) -> None:
@@ -204,6 +217,7 @@ class GridRunner:
         self.stop_requested = False
         self.stop_signal: str | None = None
         self._stream_reconcile_needed = False
+        self._next_periodic_reconcile_at = time.monotonic() + self.PERIODIC_RECONCILE_INTERVAL_SECONDS
 
     def _save(self) -> None:
         save_runner_state(self.store, self.state)
@@ -427,6 +441,14 @@ class GridRunner:
             if status == "FILLED":
                 self.journal.record_runner_event("RECONCILE_FILL", reason="FILLED_WHILE_DOWN",
                                                  detail=client_order_id)
+                # A fill found through REST reconciliation has no user-stream frame
+                # to journal.  Record the same terminal order event the stream
+                # would have produced so the dashboard timeline does not claim
+                # that this grid has no fills after a restart.  The preceding
+                # SUBMIT_CONFIRMED entry already carries Binance's order ID.
+                self.journal.record_order("ORDER_FILLED", order, symbol=self.config.symbol,
+                                          grid_run_id=self.state.grid_run_id,
+                                          detail={"source": "reconciliation"})
                 del self.state.orders[client_order_id]
                 self._save()
                 self._defer_replacement(self.strategy.on_fill(order))
@@ -527,6 +549,7 @@ class GridRunner:
             if abs(mark_price - self.config.reference_price) > smallest_step / 2:
                 raise RuntimeError("START_REFERENCE_PRICE is too far from the current mark price; refresh the grid preview first")
             self.exchange.assert_clean_symbol()
+            self.exchange.assert_starting_capital_available()
             # Leverage belongs to the Binance symbol configuration, not an order.
             # Apply it only after confirming there is no old exposure to modify.
             self.exchange.set_configured_leverage()
@@ -584,6 +607,21 @@ class GridRunner:
             return True
         return connected.is_set() if hasattr(connected, "is_set") else bool(connected)
 
+    def _reconcile_if_due(self) -> None:
+        """Reconcile periodically, including after an unobserved short disconnect."""
+        now = time.monotonic()
+        if now < self._next_periodic_reconcile_at:
+            return
+        self._next_periodic_reconcile_at = now + self.PERIODIC_RECONCILE_INTERVAL_SECONDS
+        try:
+            self._reconcile()
+        except (BinanceTransportError, BinanceTimestampError) as error:
+            # Preserve the live runner after a temporary REST failure; the next
+            # bounded periodic check will retry without request amplification.
+            self.journal.record_runner_event("PERIODIC_RECONCILE_RETRY",
+                                             reason=type(error).__name__, detail=repr(error))
+            logging.warning("Periodic Binance reconciliation unavailable; will retry: %s", error)
+
     def run_forever(self) -> None:
         # `start()` is inside the guard on purpose: a failure to resume (a leg that
         # vanished without a fill, an order this runner does not own) must run the
@@ -602,12 +640,13 @@ class GridRunner:
                     self._release_deferred_orders()
                 try:
                     equity = self._strategy_equity()
-                except BinanceTransportError as error:
+                except (BinanceTransportError, BinanceTimestampError) as error:
                     # The exchange request already used bounded retries.  Keep the
                     # runner and user stream alive after a transient TLS outage so
                     # a single failed account poll cannot abandon open grid orders.
+                    reason = "CLOCK_SYNC_ERROR" if isinstance(error, BinanceTimestampError) else "TRANSPORT_ERROR"
                     self.journal.record_runner_event("ACCOUNT_SNAPSHOT_RETRY",
-                                                     reason="TRANSPORT_ERROR", detail=repr(error))
+                                                     reason=reason, detail=repr(error))
                     logging.warning("Account snapshot unavailable; will retry: %s", error)
                     continue
                 roi, reason = manager.evaluate(equity)
@@ -626,6 +665,11 @@ class GridRunner:
                     self.journal.record_runner_event("STREAM_RECONNECTED")
                     self._reconcile()
                     self._stream_reconcile_needed = False
+                    self._next_periodic_reconcile_at = (
+                        time.monotonic() + self.PERIODIC_RECONCILE_INTERVAL_SECONDS
+                    )
+                else:
+                    self._reconcile_if_due()
             if self.stop_requested and not self.stopped:
                 reason = self.stop_signal or "SIGTERM"
                 logging.warning("Shutdown requested by %s; preserving exchange state", reason)
@@ -635,6 +679,19 @@ class GridRunner:
             logging.warning("Runner interrupted; preserving exchange state")
             self.journal.record_runner_event("INTERRUPTED", reason="KEYBOARD_INTERRUPT")
             self._fault_exit("KEYBOARD_INTERRUPT")
+        except BinanceRateLimitError as error:
+            detail = repr(error)
+            if error.retry_at_ms is not None:
+                detail = f"{detail}; retry_at_ms={error.retry_at_ms}"
+            logging.error("Binance rate limit reached; pausing instead of restarting: %s", detail)
+            self._fault_exit("BINANCE_RATE_LIMIT", detail=detail)
+            # Return normally: PM2's stop_exit_codes prevents an automatic restart
+            # from turning a rate limit into a request storm.
+            return
+        except BinanceTimestampError as error:
+            logging.error("Binance clock synchronization failed during startup; pausing: %s", error)
+            self._fault_exit("CLOCK_SYNC_FAILED", detail=repr(error))
+            return
         except Exception:
             self.journal.record_runner_event("RUNNER_EXCEPTION", reason="UNHANDLED_EXCEPTION",
                                              detail=traceback.format_exc())

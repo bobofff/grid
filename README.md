@@ -1,7 +1,8 @@
 # Neutral Futures Grid — MVP
 
 This is a deliberately safe first framework for a **static neutral futures grid**.
-It includes a Binance USDⓈ-M REST adapter for testnet validation. `DRY_RUN=true` and
+It includes a Binance USDⓈ-M REST adapter for Testnet validation and explicitly
+configured Mainnet execution. `DRY_RUN=true` and
 `EXECUTION_MODE=paper` are the defaults; do not change them until recovery behaviour
 has been verified on Testnet.
 
@@ -23,15 +24,21 @@ recovery, malformed user-stream frames, fill bursts, an expiring listen key, and
 operator shutdown. It uses an in-memory exchange double, so it needs no credentials
 and never touches Testnet.
 
-All trading and risk parameters live in `.env`; the committed `.env.example` lists
-every supported option. Amounts are examples, not recommendations.
+API credentials and execution switches live in `.env`; strategy and risk settings
+are migrated on first run into the `strategy_config` table in the SQLite database
+beside `STATE_FILE` (for example, `runtime/state.sqlite3`). The dashboard reads and
+writes that table, so later edits to strategy numbers in `.env` do not take effect.
+Amounts are examples, not recommendations.
 
-To verify testnet credentials without placing an order, set
-`EXECUTION_MODE=binance_testnet` while keeping `DRY_RUN=true`, then run
+To verify Binance credentials without placing an order, set either
+`EXECUTION_MODE=binance_testnet` (`BINANCE_TESTNET=true`) or
+`EXECUTION_MODE=binance_mainnet` (`BINANCE_TESTNET=false`) while keeping `DRY_RUN=true`, then run
 `python -m grid_bot.main` in the foreground. This validates account access, Hedge
 Mode, exchange filters, and mark-price valuation only. Set `DRY_RUN=false` only when
-you explicitly want to seed Testnet orders. The adapter intentionally refuses
-`BINANCE_TESTNET=false`.
+you explicitly want to submit orders. Mainnet order submission additionally requires
+`LIVE_TRADING_CONFIRMATION=I_UNDERSTAND_LIVE_TRADING`; keep this only in the
+server-local `.env`, never in source control. The execution mode and `BINANCE_TESTNET`
+must match, so a Testnet key cannot accidentally be sent to Mainnet or vice versa.
 
 ## Start it
 
@@ -71,6 +78,21 @@ pm2 logs grid-dashboard
 The dashboard is supervised independently as `grid-dashboard`, so restarting its
 web server does not interrupt a running strategy. Its logs are written to
 `runtime/dashboard-pm2-out.log` and `runtime/dashboard-pm2-error.log`.
+
+### Daily log rotation
+
+Run this once on the machine that runs PM2 (after activating the project is not
+required):
+
+```bash
+./scripts/configure-pm2-logrotate.sh
+```
+
+It installs/configures PM2's official rotation module. PM2 output and error logs
+rotate at midnight in `Asia/Shanghai`, receive a `YYYY-MM-DD` suffix, are
+compressed after rotation, and keep 14 days. A noisy process is also rotated at
+20 MB instead of waiting for midnight. The application's own logs are written as
+`runtime/grid_bot-YYYY-MM-DD.log` and switch files at midnight in `Asia/Shanghai`.
 
 `grid-bot` uses PM2 exponential restart backoff: it waits at least five seconds
 after an early failure, increases the wait for consecutive failures, and stops

@@ -53,6 +53,11 @@ class TradeJournal:
                     status TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS grid_runs_created_at ON grid_runs(created_at DESC);
+                CREATE TABLE IF NOT EXISTS strategy_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
             """)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(order_events)")}
             if "grid_run_id" not in columns:
@@ -67,6 +72,24 @@ class TradeJournal:
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=10)
+
+    def strategy_config(self) -> dict[str, str]:
+        """Return editable strategy settings. Credentials never belong in this table."""
+        with self._connect() as connection:
+            rows = connection.execute("SELECT key, value FROM strategy_config").fetchall()
+        return {str(key): str(value) for key, value in rows}
+
+    def save_strategy_config(self, values: dict[str, str]) -> None:
+        """Atomically upsert non-secret strategy settings."""
+        if not values:
+            return
+        now = self._now()
+        with self._connect() as connection:
+            connection.executemany(
+                """INSERT INTO strategy_config (key, value, updated_at) VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at""",
+                [(key, value, now) for key, value in values.items()],
+            )
 
     @staticmethod
     def _now() -> str:
@@ -143,6 +166,19 @@ class TradeJournal:
                           level_index, price, side, purpose, detail_json
                    FROM order_events WHERE grid_run_id = ? ORDER BY id""", (run_id,)
             ).fetchall()
+            # Older runners logged a fill discovered during restart reconciliation
+            # only in runner_events.  Client IDs include the grid-run prefix, so
+            # these records can be safely attributed while retaining history made
+            # before ORDER_FILLED was journaled directly.
+            reconciled_fills = {
+                row[0] for row in connection.execute(
+                    """SELECT detail FROM runner_events
+                       WHERE event_type = 'RECONCILE_FILL'
+                         AND reason = 'FILLED_WHILE_DOWN'
+                         AND detail LIKE ?""",
+                    (f"g-{run_id[:12]}-%",),
+                )
+            }
         orders: dict[str, dict[str, Any]] = {}
         for occurred_at, event_type, client_order_id, binance_order_id, symbol, level_index, price, side, purpose, detail_json in rows:
             if not client_order_id:
@@ -155,6 +191,16 @@ class TradeJournal:
                 order["binance_order_id"] = binance_order_id
             if event_type.startswith("ORDER_"):
                 order["status"] = event_type.removeprefix("ORDER_")
+            elif event_type == "SUBMIT_CONFIRMED":
+                # The REST acknowledgement means the exchange accepted the
+                # order. A later user-stream ORDER_NEW/FILLED event, when it
+                # arrives, will still take precedence.
+                order["status"] = "NEW"
+            elif event_type == "SUBMIT_FAILED":
+                order["status"] = "SUBMIT_FAILED"
+        for client_order_id in reconciled_fills:
+            if client_order_id in orders:
+                orders[client_order_id]["status"] = "FILLED"
         return list(orders.values())
 
     def record_runner_event(self, event_type: str, *, reason: str | None = None,

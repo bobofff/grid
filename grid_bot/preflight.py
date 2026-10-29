@@ -63,7 +63,7 @@ def main() -> int:
         positions = exchange.positions()
         open_orders = exchange.open_orders()
     except BinanceApiError as error:
-        print(f"\n  [!!] Testnet rejected the read-only preflight: {error}")
+        print(f"\n  [!!] Binance rejected the read-only preflight: {error}")
         return 1
 
     _rule("exchange")

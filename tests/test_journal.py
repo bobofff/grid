@@ -68,3 +68,20 @@ class TradeJournalTests(unittest.TestCase):
                                    "submitted_at": orders[0]["submitted_at"], "binance_order_id": "456",
                                    "symbol": "BTCUSDT", "level_index": 2, "price": 84_000.0,
                                    "side": "BUY", "purpose": "OPEN_LONG", "status": "FILLED"}])
+
+    def test_grid_run_includes_a_legacy_fill_found_during_restart_reconciliation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            journal = TradeJournal.for_state_file(str(Path(directory) / "state.json"))
+            run_id = "a1b2c3d4e5f6"
+            order = GridOrder(2, 84_000.0, Side.BUY, Purpose.OPEN_LONG, False, 2,
+                              "g-a1b2c3d4e5f6-01234567890123456789")
+            journal.record_order("SUBMIT_INTENT", order, symbol="BTCUSDT", grid_run_id=run_id)
+            journal.record_order("SUBMIT_CONFIRMED", order, binance_order_id="456",
+                                 symbol="BTCUSDT", grid_run_id=run_id)
+            journal.record_runner_event("RECONCILE_FILL", reason="FILLED_WHILE_DOWN",
+                                        detail=order.client_order_id)
+
+            orders = journal.grid_run_orders(run_id)
+
+        self.assertEqual(orders[0]["status"], "FILLED")
+        self.assertEqual(orders[0]["binance_order_id"], "456")

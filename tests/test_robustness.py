@@ -19,8 +19,9 @@ import time
 import unittest
 from unittest.mock import patch
 
-from grid_bot.exchange import BinanceApiError, BinanceTransportError
+from grid_bot.exchange import BinanceApiError, BinanceRateLimitError, BinanceTransportError
 from grid_bot.models import Purpose
+from grid_bot.journal import TradeJournal
 from grid_bot.runner import (
     BinanceUserStream,
     install_signal_handlers,
@@ -109,6 +110,26 @@ class ResumeReconciliationTests(RunnerTestCase):
         self.assertNotIn(filled.client_order_id, resumed.state.orders)
         self.assertEqual(len(resumed.state.orders), 4)
         self.assertEqual(resumed.state.phase, "RUNNING")
+        self.assertIn("RECONCILE_FILL", journal_event_types(self.state_file))
+        timeline = TradeJournal.for_state_file(self.state_file).grid_run_orders(
+            resumed.state.grid_run_id
+        )
+        recovered = next(item for item in timeline
+                         if item["client_order_id"] == filled.client_order_id)
+        self.assertEqual(recovered["status"], "FILLED")
+
+    def test_periodic_reconciliation_repairs_a_fill_after_a_short_unobserved_disconnect(self):
+        runner, _ = self.started_runner()
+        filled = max((order for order in self.exchange.submitted
+                      if order.purpose is Purpose.OPEN_LONG), key=lambda order: order.level_index)
+        self.exchange.fill(filled.client_order_id)
+        submitted_before = self.exchange.count("submit_grid_order")
+        runner._next_periodic_reconcile_at = 0
+
+        runner._reconcile_if_due()
+
+        self.assertNotIn(filled.client_order_id, runner.state.orders)
+        self.assertEqual(self.exchange.count("submit_grid_order"), submitted_before + 1)
         self.assertIn("RECONCILE_FILL", journal_event_types(self.state_file))
 
     def test_an_empty_resume_is_rejected_instead_of_running_a_blank_grid(self):
@@ -488,6 +509,20 @@ class EventLoopTests(RunnerTestCase):
         self.assertEqual(self.exchange.count("close_all_positions"), 0)
         self.assertEqual(load_runner_state(StateStore(self.state_file)).phase,
                          "PAUSED:SIGTERM")
+
+    def test_rate_limit_pauses_without_pm2_restart_exit(self):
+        runner, _ = self.started_runner()
+        self.exchange.restart()
+
+        def limited():
+            raise BinanceRateLimitError("too many requests", code=-1003,
+                                        retry_at_ms=1_234_567_890_123)
+
+        runner._strategy_equity = limited
+        self.assertIsNone(self.run_until_stopped(runner))
+        self.assertEqual(load_runner_state(StateStore(self.state_file)).phase,
+                         "PAUSED:BINANCE_RATE_LIMIT")
+        self.assertNotIn("close_all_positions", self.exchange.calls)
 
     def test_websocket_disconnect_never_flattens_or_submits_blindly(self):
         runner, _ = self.started_runner()

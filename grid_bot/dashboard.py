@@ -15,12 +15,14 @@ from datetime import datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 import shutil
 import subprocess
+from threading import Lock
+import time
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
-from .config import GridConfig
+from .config import GridConfig, STRATEGY_CONFIG_KEYS, StrategyConfigNotInitialized
 from .exchange import BinanceUsdmExchange, BinanceApiError
 from .journal import TradeJournal
 from .state import RunnerState, StateStore, load_runner_state, save_runner_state
@@ -31,6 +33,10 @@ ROOT = Path(__file__).resolve().parent.parent
 STATIC_DIR = Path(__file__).resolve().parent / "dashboard_static"
 ENV_FILE = ROOT / ".env"
 BINANCE_TESTNET_PUBLIC_URL = "https://testnet.binancefuture.com"
+BINANCE_MAINNET_PUBLIC_URL = "https://fapi.binance.com"
+STATUS_CACHE_SECONDS = 120
+_status_cache_lock = Lock()
+_status_cache: tuple[float, dict[str, Any]] | None = None
 EDITABLE_FIELDS = {
     "SYMBOL", "GRID_LOWER_PRICE", "GRID_UPPER_PRICE", "GRID_COUNT", "GRID_SPACING",
     "LEVERAGE", "START_REFERENCE_PRICE", "INITIAL_CAPITAL_USDT",
@@ -51,12 +57,13 @@ def launch_runner() -> str:
 def start_new_grid() -> dict[str, Any]:
     """Start a fresh grid after proving it cannot overwrite exchange work."""
     config = GridConfig.from_env(str(ENV_FILE))
-    if config.execution_mode != "binance_testnet" or config.dry_run or not config.runner_enabled:
-        raise ValueError("请启用 Binance Testnet、DRY_RUN=false 和 RUNNER_ENABLED=true 后再启动")
+    if config.execution_mode not in {"binance_testnet", "binance_mainnet"} or config.dry_run or not config.runner_enabled:
+        raise ValueError("请启用 Binance 合约模式、DRY_RUN=false 和 RUNNER_ENABLED=true 后再启动")
 
     exchange = BinanceUsdmExchange(config)
     exchange.verify_account()
     exchange.assert_clean_symbol()
+    exchange.assert_starting_capital_available()
 
     # A faulted PM2 instance can still be inside an exponential-restart window.
     # Stop it before replacing state, otherwise its stale in-memory runner can
@@ -74,7 +81,8 @@ def start_new_grid() -> dict[str, Any]:
     # Refresh the reference immediately before spawning so page-refresh latency
     # cannot make a freshly saved grid fail its startup drift check.
     mark_price = exchange.mark_price()
-    write_env({"START_REFERENCE_PRICE": str(mark_price)})
+    write_strategy_config(config.state_file, {"START_REFERENCE_PRICE": str(mark_price)})
+    config = GridConfig.from_env(str(ENV_FILE))
     run_id = uuid4().hex[:12]
     journal = TradeJournal.for_state_file(config.state_file)
     journal.create_grid_run(run_id, public_config(config))
@@ -105,8 +113,8 @@ def exit_grid() -> dict[str, Any]:
     inspect/retry instead of a background process placing another replacement leg.
     """
     config = GridConfig.from_env(str(ENV_FILE))
-    if config.execution_mode != "binance_testnet" or config.dry_run:
-        raise ValueError("一键平仓仅适用于已启用的 Binance Testnet 策略")
+    if config.execution_mode not in {"binance_testnet", "binance_mainnet"} or config.dry_run:
+        raise ValueError("一键平仓仅适用于已启用的 Binance 合约策略")
     status = pm2_status()
     if not status["known"]:
         raise ValueError("未找到 PM2 管理的 grid-bot；为避免与未知进程竞争，已拒绝平仓")
@@ -192,8 +200,12 @@ def pm2_status() -> dict[str, Any]:
 def pm2_action(action: str) -> dict[str, Any]:
     """Execute one allow-listed PM2 lifecycle action for the strategy only."""
     commands = {
-        "start": ["pm2", "start", "ecosystem.config.js", "--only", PM2_GRID_PROCESS],
-        "restart": ["pm2", "restart", PM2_GRID_PROCESS],
+        # Reload the ecosystem definition when a stopped runner is started, so
+        # safety options such as stop_exit_codes are never left stale in PM2.
+        "start": ["pm2", "start", "ecosystem.config.js", "--only", PM2_GRID_PROCESS,
+                  "--update-env"],
+        "restart": ["pm2", "restart", "ecosystem.config.js", "--only", PM2_GRID_PROCESS,
+                    "--update-env"],
         "stop": ["pm2", "stop", PM2_GRID_PROCESS],
     }
     if action not in commands:
@@ -245,7 +257,10 @@ def funding_plan(config: GridConfig, strategy: StaticNeutralGrid,
         minimum_notionals.append(minimum_quantity * price)
         quantity = _round_down(requested_per_order / price, step)
         actual_notionals.append(quantity * price)
-    required_margin = sum(minimum_notionals) / Decimal(config.leverage)
+    # Capital is split evenly across every opening leg.  The limiting leg is
+    # therefore the one with the largest exchange-rounded minimum, not the sum
+    # of individually-minimum orders (which would assume unequal allocation).
+    required_margin = max(minimum_notionals) * len(orders) / Decimal(config.leverage)
     sufficient = all(actual >= required for actual, required in zip(actual_notionals, minimum_notionals))
     return {
         "initial_order_count": len(orders),
@@ -259,17 +274,12 @@ def funding_plan(config: GridConfig, strategy: StaticNeutralGrid,
 
 
 def config_from_values(values: dict[str, str]) -> GridConfig:
-    """Validate unsaved form values without persisting them to .env."""
-    previous = {key: os.environ.get(key) for key in values}
-    os.environ.update(values)
-    try:
-        return GridConfig.from_env(str(ENV_FILE))
-    finally:
-        for key, old in previous.items():
-            if old is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = old
+    """Validate unsaved form values against the persisted SQLite settings."""
+    # The form intentionally does not expose per-order notional: it is computed
+    # from total capital and exchange rules after this provisional validation.
+    return GridConfig.from_env(str(ENV_FILE), strategy_overrides={
+        "ORDER_NOTIONAL_USDT": "1", "LOOP_INTERVAL_SECONDS": "2", **values,
+    })
 
 
 def public_position(position: dict[str, Any]) -> dict[str, Any]:
@@ -301,6 +311,24 @@ def strategy_health_snapshot(config: GridConfig, state: RunnerState,
     if state.phase == "RUNNING" and pm2.get("status") != "online":
         checks.append({"level": "critical", "title": "PM2 策略守护未运行",
                        "detail": "交易所上的挂单仍可能成交，但没有运行中的策略处理成交后的替换或平仓。"})
+
+    # The persisted state is an intent ledger, while Binance is the source of
+    # truth for live orders.  A count-only health check can look green after a
+    # user-stream fill was missed, so compare strategy-owned client IDs directly.
+    tracked_ids = {str(client_id) for client_id in state.orders if str(client_id).startswith("g-")}
+    live_ids = {
+        str(order.get("client_id")) for order in open_orders
+        if str(order.get("client_id", "")).startswith("g-")
+    }
+    missing_from_exchange = tracked_ids - live_ids
+    unexpected_on_exchange = live_ids - tracked_ids
+    if missing_from_exchange:
+        checks.append({"level": "critical", "title": "策略订单与 Binance 挂单不一致",
+                       "detail": f"本地追踪 {len(tracked_ids)} 笔，Binance 当前挂单 {len(live_ids)} 笔；"
+                                 f"其中 {len(missing_from_exchange)} 笔本地订单不在 Binance 挂单中，需要对账。"})
+    if unexpected_on_exchange:
+        checks.append({"level": "critical", "title": "Binance 存在未追踪的策略订单",
+                       "detail": f"发现 {len(unexpected_on_exchange)} 笔带策略订单号的 Binance 挂单未在本地状态中。"})
 
     deferred = state.deferred_orders
     for payload in deferred:
@@ -339,7 +367,8 @@ def strategy_health_snapshot(config: GridConfig, state: RunnerState,
         "warning" if any(item["level"] == "warning" for item in checks) else "ok"
     )
     return {"level": level, "checks": checks,
-            "tracked_order_count": len(state.orders), "deferred_order_count": len(deferred)}
+            "tracked_order_count": len(state.orders), "live_strategy_order_count": len(live_ids),
+            "deferred_order_count": len(deferred)}
 
 
 def performance_started_at(config: GridConfig, state: RunnerState) -> datetime | None:
@@ -385,10 +414,10 @@ def performance_snapshot(config: GridConfig, equity: float, positions: list[dict
             "annualized_roi": annualized_roi, "started_at": started_at.isoformat()}
 
 
-def public_market_snapshot(symbol: str) -> dict[str, Any]:
-    """Read public Testnet market data without accessing the trading account."""
-    mark = public_binance_request("/fapi/v1/premiumIndex", {"symbol": symbol})
-    ticker = public_binance_request("/fapi/v1/ticker/24hr", {"symbol": symbol})
+def public_market_snapshot(symbol: str, execution_mode: str) -> dict[str, Any]:
+    """Read public market data from the selected Binance environment."""
+    mark = public_binance_request("/fapi/v1/premiumIndex", {"symbol": symbol}, execution_mode)
+    ticker = public_binance_request("/fapi/v1/ticker/24hr", {"symbol": symbol}, execution_mode)
     if not isinstance(mark, dict) or not isinstance(ticker, dict):
         raise BinanceApiError("Binance 行情返回了无效数据")
     try:
@@ -401,9 +430,10 @@ def public_market_snapshot(symbol: str) -> dict[str, Any]:
         raise BinanceApiError("Binance 行情返回了无效价格数据") from error
 
 
-def public_binance_request(path: str, params: dict[str, Any]) -> Any:
-    """Read an unsigned Testnet endpoint with a browser-like user agent."""
-    url = f"{BINANCE_TESTNET_PUBLIC_URL}{path}?{urlencode(params)}"
+def public_binance_request(path: str, params: dict[str, Any], execution_mode: str) -> Any:
+    """Read an unsigned endpoint with a browser-like user agent."""
+    base_url = BINANCE_TESTNET_PUBLIC_URL if execution_mode == "binance_testnet" else BINANCE_MAINNET_PUBLIC_URL
+    url = f"{base_url}{path}?{urlencode(params)}"
     try:
         headers = {"User-Agent": "GridConsole/1.0"}
         # Testnet accepts unsigned market endpoints, but sending the configured
@@ -420,24 +450,76 @@ def public_binance_request(path: str, params: dict[str, Any]) -> Any:
     return payload
 
 
-def write_env(values: dict[str, str]) -> None:
-    if not ENV_FILE.exists():
-        raise ValueError("Create .env from .env.example before saving configuration")
-    lines = ENV_FILE.read_text().splitlines()
-    remaining = dict(values)
-    rewritten: list[str] = []
-    for line in lines:
-        key, marker, _ = line.partition("=")
-        if marker and key.strip() in remaining:
-            name = key.strip()
-            rewritten.append(f"{name}={remaining.pop(name)}")
-        else:
-            rewritten.append(line)
-    rewritten.extend(f"{key}={value}" for key, value in remaining.items())
-    temporary = ENV_FILE.with_suffix(".tmp")
-    temporary.write_text("\n".join(rewritten) + "\n")
-    temporary.replace(ENV_FILE)
-    os.environ.update(values)
+def write_strategy_config(state_file: str, values: dict[str, str]) -> None:
+    """Persist editable non-secret settings without ever rewriting .env."""
+    invalid = set(values) - STRATEGY_CONFIG_KEYS
+    if invalid:
+        raise ValueError(f"Attempt to store protected setting(s): {', '.join(sorted(invalid))}")
+    TradeJournal.for_state_file(state_file).save_strategy_config(values)
+    invalidate_status_cache()
+
+
+def invalidate_status_cache() -> None:
+    """Discard the shared REST snapshot after an operator changes configuration."""
+    global _status_cache
+    with _status_cache_lock:
+        _status_cache = None
+
+
+def status_snapshot() -> dict[str, Any]:
+    """Return a shared, bounded-frequency Binance snapshot for all dashboard tabs."""
+    global _status_cache
+    now = time.monotonic()
+    with _status_cache_lock:
+        if _status_cache is not None and now - _status_cache[0] < STATUS_CACHE_SECONDS:
+            return _status_cache[1]
+
+        try:
+            config = GridConfig.from_env(str(ENV_FILE))
+        except StrategyConfigNotInitialized:
+            result = {
+                "mode": "unconfigured", "dry_run": True, "connected": False,
+                "message": "请先在策略参数表单中填写并保存完整配置。",
+                "positions": [], "open_orders": [],
+            }
+            _status_cache = (time.monotonic(), result)
+            return result
+        result: dict[str, Any] = {
+            "mode": config.execution_mode, "dry_run": config.dry_run,
+            "connected": False, "message": "Paper mode: no exchange connection.",
+            "positions": [], "open_orders": [],
+        }
+        if config.execution_mode in {"binance_testnet", "binance_mainnet"} and config.binance_api_key:
+            exchange = BinanceUsdmExchange(config)
+            exchange.verify_account(load_symbol_filters=False)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                equity_future = pool.submit(exchange.equity_snapshot)
+                mark_future = pool.submit(exchange.mark_price)
+                positions_future = pool.submit(exchange.positions)
+                orders_future = pool.submit(exchange.open_orders)
+                equity = equity_future.result().equity(config.initial_capital_usdt)
+                mark_price = mark_future.result()
+                raw_positions = positions_future.result()
+                positions = [public_position(item) for item in raw_positions]
+                open_orders = [public_order(item) for item in orders_future.result()]
+            state = load_runner_state(StateStore(config.state_file))
+            try:
+                pm2 = pm2_status()
+            except ValueError:
+                pm2 = {"known": False, "status": "unavailable", "pid": None, "restarts": 0}
+            started_at = performance_started_at(config, state)
+            income = exchange.income_history(int(started_at.timestamp() * 1000)) if started_at and state.baseline_account_equity is not None else []
+            result = {
+                "mode": config.execution_mode, "dry_run": config.dry_run, "connected": True,
+                "mark_price": mark_price, "equity": equity, "roi": None,
+                "positions": positions, "open_orders": open_orders,
+                "performance": performance_snapshot(config, equity, raw_positions, income),
+                "strategy_health": strategy_health_snapshot(
+                    config, state, raw_positions, open_orders, pm2),
+                "message": "Binance connected. No strategy runner is active yet; ROI starts when a strategy baseline is recorded.",
+            }
+        _status_cache = (time.monotonic(), result)
+        return result
 
 
 class DashboardHandler(SimpleHTTPRequestHandler):
@@ -458,11 +540,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store, max-age=0")
         super().end_headers()
 
-    def _config_and_preview(self) -> tuple[GridConfig, dict[str, Any]]:
-        config = GridConfig.from_env(str(ENV_FILE))
+    def _config_and_preview(self) -> tuple[GridConfig | None, dict[str, Any]]:
+        try:
+            config = GridConfig.from_env(str(ENV_FILE))
+        except StrategyConfigNotInitialized:
+            return None, {"configured": False, "config": {
+                "symbol": "SOLUSDT", "spacing": "arithmetic", "grid_count": 0,
+            }, "levels": [], "orders": [], "funding": None}
         strategy = StaticNeutralGrid(config)
         orders = strategy.initial_orders()
-        return config, {"config": public_config(config), "levels": strategy.levels,
+        return config, {"configured": True, "config": public_config(config), "levels": strategy.levels,
                         "orders": [{"price": o.price, "side": o.side.value, "purpose": o.purpose.value,
                                     "reduce_only": o.reduce_only} for o in orders], "funding": None}
 
@@ -474,48 +561,20 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(response)
                 return
             if path == "/api/status":
-                config, _ = self._config_and_preview()
-                result: dict[str, Any] = {"mode": config.execution_mode, "dry_run": config.dry_run,
-                                           "connected": False, "message": "Paper mode: no exchange connection.",
-                                           "positions": [], "open_orders": []}
-                if config.execution_mode == "binance_testnet" and config.binance_api_key:
-                    exchange = BinanceUsdmExchange(config)
-                    # The dashboard only reads status. Exchange filters are needed on
-                    # order submission, not here, and the large exchangeInfo response
-                    # made ordinary page refreshes unnecessarily slow.
-                    exchange.verify_account(load_symbol_filters=False)
-                    with ThreadPoolExecutor(max_workers=4) as pool:
-                        equity_future = pool.submit(exchange.equity_snapshot)
-                        mark_future = pool.submit(exchange.mark_price)
-                        positions_future = pool.submit(exchange.positions)
-                        orders_future = pool.submit(exchange.open_orders)
-                        equity = equity_future.result().equity(config.initial_capital_usdt)
-                        mark_price = mark_future.result()
-                        raw_positions = positions_future.result()
-                        positions = [public_position(item) for item in raw_positions]
-                        open_orders = [public_order(item) for item in orders_future.result()]
-                    state = load_runner_state(StateStore(config.state_file))
-                    try:
-                        pm2 = pm2_status()
-                    except ValueError:
-                        pm2 = {"known": False, "status": "unavailable", "pid": None, "restarts": 0}
-                    started_at = performance_started_at(config, state)
-                    income = exchange.income_history(int(started_at.timestamp() * 1000)) if started_at and state.baseline_account_equity is not None else []
-                    result = {"mode": "binance_testnet", "dry_run": config.dry_run, "connected": True,
-                              "mark_price": mark_price, "equity": equity, "roi": None,
-                              "positions": positions, "open_orders": open_orders,
-                              "performance": performance_snapshot(config, equity, raw_positions, income),
-                              "strategy_health": strategy_health_snapshot(
-                                  config, state, raw_positions, open_orders, pm2),
-                              "message": "Testnet connected. No strategy runner is active yet; ROI starts when a strategy baseline is recorded."}
-                self._json(result)
+                self._json(status_snapshot())
                 return
             if path == "/api/market":
                 config, _ = self._config_and_preview()
-                symbol = parse_qs(urlparse(self.path).query).get("symbol", [config.symbol])[0]
+                symbol = parse_qs(urlparse(self.path).query).get(
+                    "symbol", [config.symbol if config else "SOLUSDT"]
+                )[0]
                 if symbol not in {"SOLUSDT", "BTCUSDT", "ETHUSDT"}:
                     raise ValueError("Unsupported market symbol")
-                self._json(public_market_snapshot(symbol))
+                mode = config.execution_mode if config else (
+                    "binance_testnet" if os.getenv("BINANCE_TESTNET", "").lower() == "true"
+                    else "binance_mainnet"
+                )
+                self._json(public_market_snapshot(symbol, mode))
                 return
             if path == "/api/runner-log":
                 self._json(runner_console())
@@ -525,6 +584,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return
             if path == "/api/grid-runs":
                 config, _ = self._config_and_preview()
+                if config is None:
+                    self._json({"runs": []})
+                    return
                 state = load_runner_state(StateStore(config.state_file))
                 runs = TradeJournal.for_state_file(config.state_file).grid_runs()
                 for run in runs:
@@ -535,6 +597,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return
             if path.startswith("/api/grid-runs/") and path.endswith("/orders"):
                 config, _ = self._config_and_preview()
+                if config is None:
+                    raise ValueError("请先保存策略配置")
                 run_id = path.removeprefix("/api/grid-runs/").removesuffix("/orders").strip("/")
                 if not run_id:
                     raise ValueError("Missing grid run ID")
@@ -567,41 +631,34 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if set(data) - EDITABLE_FIELDS:
                 raise ValueError("Attempt to modify a protected setting")
             values = {key: str(value) for key, value in data.items()}
+            # The first UI does not expose this tuning, but every new strategy
+            # must persist it instead of inheriting an obsolete .env setting.
+            values.setdefault("LOOP_INTERVAL_SECONDS", "2")
             if path == "/api/order-rules":
                 config = config_from_values(values)
-                if config.execution_mode != "binance_testnet":
-                    raise ValueError("请先切换到 Binance Testnet 模式后读取下单规则")
+                if config.execution_mode not in {"binance_testnet", "binance_mainnet"}:
+                    raise ValueError("请先切换到 Binance 合约模式后读取下单规则")
                 plan = funding_plan(config, StaticNeutralGrid(config),
                                     BinanceUsdmExchange(config).symbol_order_rules())
                 self._json({"funding": plan})
                 return
-            old_environment = {key: os.environ.get(key) for key in (*values, "ORDER_NOTIONAL_USDT")}
-            os.environ.update(values)
-            try:
-                provisional = GridConfig.from_env(str(ENV_FILE), prefer_file=False)
-                if provisional.execution_mode == "binance_testnet":
-                    plan = funding_plan(provisional, StaticNeutralGrid(provisional),
-                                        BinanceUsdmExchange(provisional).symbol_order_rules())
-                    if not plan["sufficient"]:
-                        raise ValueError(
-                            f"本次网格投入不足。至少需要 {plan['minimum_margin_usdt']:.2f} USDT 保证金；"
-                            f"建议投入 {plan['recommended_margin_usdt']:.2f} USDT。"
-                        )
-                    values["ORDER_NOTIONAL_USDT"] = str(plan["per_order_notional_usdt"])
-                    os.environ.update(values)
-                    GridConfig.from_env(str(ENV_FILE), prefer_file=False)
-            finally:
-                for key, old in old_environment.items():
-                    if old is None:
-                        os.environ.pop(key, None)
-                    else:
-                        os.environ[key] = old
-            write_env(values)
+            provisional = config_from_values(values)
+            if provisional.execution_mode in {"binance_testnet", "binance_mainnet"}:
+                plan = funding_plan(provisional, StaticNeutralGrid(provisional),
+                                    BinanceUsdmExchange(provisional).symbol_order_rules())
+                if not plan["sufficient"]:
+                    raise ValueError(
+                        f"本次网格投入不足。至少需要 {plan['minimum_margin_usdt']:.2f} USDT 保证金；"
+                        f"建议投入 {plan['recommended_margin_usdt']:.2f} USDT。"
+                    )
+                values["ORDER_NOTIONAL_USDT"] = str(plan["per_order_notional_usdt"])
+                provisional = config_from_values(values)
+            write_strategy_config(provisional.state_file, values)
             if path == "/api/start":
                 self._json(start_new_grid())
                 return
             _, response = self._config_and_preview()
-            response["funding"] = plan if provisional.execution_mode == "binance_testnet" else None
+            response["funding"] = plan if provisional.execution_mode in {"binance_testnet", "binance_mainnet"} else None
             self._json(response)
         except (ValueError, json.JSONDecodeError) as error:
             self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
