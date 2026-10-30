@@ -6,7 +6,7 @@ remain available for later review.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
@@ -58,6 +58,22 @@ class TradeJournal:
                     value TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS email_outbox (
+                    id INTEGER PRIMARY KEY,
+                    dedupe_key TEXT NOT NULL UNIQUE,
+                    subject TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    delivered_at TEXT,
+                    lease_until TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    failed_at TEXT
+                );
+                CREATE TABLE IF NOT EXISTS email_notification_cooldowns (
+                    dedupe_key TEXT PRIMARY KEY,
+                    blocked_until TEXT NOT NULL
+                );
             """)
             columns = {row[1] for row in connection.execute("PRAGMA table_info(order_events)")}
             if "grid_run_id" not in columns:
@@ -65,6 +81,9 @@ class TradeJournal:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS order_events_grid_run_id ON order_events(grid_run_id, id)"
             )
+            outbox_columns = {row[1] for row in connection.execute("PRAGMA table_info(email_outbox)")}
+            if "failed_at" not in outbox_columns:
+                connection.execute("ALTER TABLE email_outbox ADD COLUMN failed_at TEXT")
 
     @classmethod
     def for_state_file(cls, state_file: str) -> "TradeJournal":
@@ -210,6 +229,128 @@ class TradeJournal:
                 "INSERT INTO runner_events (occurred_at, event_type, reason, detail) VALUES (?, ?, ?, ?)",
                 (self._now(), event_type, reason, detail),
             )
+
+    def enqueue_email_notification(self, dedupe_key: str, subject: str, body: str) -> int | None:
+        """Persist a notification before dispatch so process restarts can recover it."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO email_outbox (dedupe_key, subject, body, created_at) "
+                "VALUES (?, ?, ?, ?)", (dedupe_key, subject, body, self._now()),
+            )
+            if cursor.rowcount != 1:
+                return None
+            return int(cursor.lastrowid)
+
+    def email_notification_exists(self, dedupe_key: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM email_outbox WHERE dedupe_key = ? LIMIT 1", (dedupe_key,),
+            ).fetchone()
+        return row is not None
+
+    def pending_email_notifications(self, limit: int = 100) -> list[int]:
+        now = self._now()
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM email_outbox WHERE delivered_at IS NULL AND failed_at IS NULL "
+                "AND (lease_until IS NULL OR lease_until <= ?) ORDER BY id LIMIT ?",
+                (now, limit),
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def claim_email_notification(self, notification_id: int, lease_seconds: int = 120) -> bool:
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat(timespec="milliseconds")
+        lease_text = (now + timedelta(seconds=lease_seconds)).isoformat(timespec="milliseconds")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE email_outbox SET lease_until = ? WHERE id = ? AND delivered_at IS NULL "
+                "AND (lease_until IS NULL OR lease_until <= ?)",
+                (lease_text, notification_id, now_text),
+            )
+        return cursor.rowcount == 1
+
+    def get_email_notification(self, notification_id: int) -> dict[str, str] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT subject, body FROM email_outbox WHERE id = ? AND delivered_at IS NULL",
+                (notification_id,),
+            ).fetchone()
+        return {"subject": str(row[0]), "body": str(row[1])} if row else None
+
+    def mark_email_notification_delivered(self, notification_id: int) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE email_outbox SET delivered_at = ?, lease_until = NULL, last_error = NULL "
+                "WHERE id = ?", (self._now(), notification_id),
+            )
+
+    def release_email_notification(self, notification_id: int, error: str,
+                                   retry_after_seconds: int = 60,
+                                   max_attempts: int = 5) -> bool:
+        """Release a failed delivery and return whether it became permanently failed."""
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat(timespec="milliseconds")
+        retry_at = (now + timedelta(seconds=retry_after_seconds)).isoformat(timespec="milliseconds")
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE email_outbox SET attempts = attempts + 1, last_error = ?, "
+                "lease_until = CASE WHEN attempts + 1 >= ? THEN NULL ELSE ? END, "
+                "failed_at = CASE WHEN attempts + 1 >= ? THEN ? ELSE failed_at END "
+                "WHERE id = ? AND delivered_at IS NULL",
+                (error[:1000], max_attempts, retry_at, max_attempts, now_text, notification_id),
+            )
+            row = connection.execute(
+                "SELECT failed_at IS NOT NULL FROM email_outbox WHERE id = ?", (notification_id,),
+            ).fetchone()
+        return bool(row and row[0])
+
+    def claim_email_cooldown(self, dedupe_key: str, cooldown_seconds: float) -> bool:
+        """Atomically claim a notification key until its cooldown expires."""
+        now = datetime.now(timezone.utc)
+        now_text = now.isoformat(timespec="milliseconds")
+        blocked_until = (now + timedelta(seconds=cooldown_seconds)).isoformat(timespec="milliseconds")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """INSERT INTO email_notification_cooldowns (dedupe_key, blocked_until) VALUES (?, ?)
+                   ON CONFLICT(dedupe_key) DO UPDATE SET blocked_until = excluded.blocked_until
+                   WHERE email_notification_cooldowns.blocked_until <= ?""",
+                (dedupe_key, blocked_until, now_text),
+            )
+        return cursor.rowcount == 1
+
+    def latest_runner_event_at(self, event_type: str, *, reason: str | None = None) -> datetime | None:
+        with self._connect() as connection:
+            if reason is None:
+                row = connection.execute(
+                    "SELECT occurred_at FROM runner_events WHERE event_type = ? ORDER BY id DESC LIMIT 1",
+                    (event_type,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    "SELECT occurred_at FROM runner_events WHERE event_type = ? AND reason = ? "
+                    "ORDER BY id DESC LIMIT 1", (event_type, reason),
+                ).fetchone()
+        return datetime.fromisoformat(row[0]) if row else None
+
+    def runner_error_count(self) -> int:
+        """Count operational faults/retries recorded by the runner, not ordinary fills."""
+        event_types = (
+            "EXIT_STEP_FAILED", "ORDER_EVENT_UNPARSEABLE", "PERIODIC_RECONCILE_RETRY",
+            "ACCOUNT_SNAPSHOT_RETRY", "WEBSOCKET_ERROR", "STREAM_DISCONNECTED",
+            "SUMMARY_SNAPSHOT_FAILED", "ORDER_SUBMIT_FAILED",
+        )
+        placeholders = ",".join("?" for _ in event_types)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT COUNT(*) FROM runner_events WHERE event_type IN ({placeholders})",
+                event_types,
+            ).fetchone()
+            stopped = connection.execute(
+                "SELECT COUNT(*) FROM runner_events WHERE event_type = 'FAULT_PAUSED' "
+                "AND reason NOT IN ('SIGTERM', 'SIGHUP', 'KEYBOARD_INTERRUPT')"
+            ).fetchone()
+        return int((row[0] if row else 0) + (stopped[0] if stopped else 0))
 
     def latest_order_event(self, client_order_id: str) -> dict[str, Any] | None:
         """Return the most recent raw user-stream order event for one grid leg."""

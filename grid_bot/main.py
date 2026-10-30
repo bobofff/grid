@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date, datetime
 from pathlib import Path
 import traceback
 from zoneinfo import ZoneInfo
 
 from .config import GridConfig
+from .email_notifier import EmailNotifier
 from .exchange import PaperExchange
 from .exchange import BinanceUsdmExchange
 from .journal import TradeJournal
@@ -69,11 +71,22 @@ def configure_logging() -> None:
 
 def run(config: GridConfig | None = None, journal: TradeJournal | None = None) -> None:
     config = config or GridConfig.from_env()
-    exchange = PaperExchange() if config.execution_mode == "paper" else BinanceUsdmExchange(config)
     if config.execution_mode in {"binance_testnet", "binance_mainnet"}:
-        exchange.verify_account()
+        try:
+            exchange = BinanceUsdmExchange(config)
+            exchange.verify_account()
+            mark_price = exchange.mark_price()
+        except Exception as error:
+            detail = re.sub(r"(?i)(signature=)[^&\s]+", r"\1<redacted>", str(error))[:1000]
+            notifier = EmailNotifier(
+                config, journal=journal or TradeJournal.for_state_file(config.state_file),
+            )
+            notifier.notify(f"Grid Binance 启动校验异常 - {config.symbol}",
+                            f"错误类型：{type(error).__name__}\n详情：{detail}")
+            notifier.flush(timeout=12)
+            raise
         environment = "Testnet" if config.execution_mode == "binance_testnet" else "Mainnet"
-        logging.info("Binance %s verified; mark price=%.8f", environment, exchange.mark_price())
+        logging.info("Binance %s verified; mark price=%.8f", environment, mark_price)
         if config.dry_run:
             logging.info("DRY_RUN=true: Binance %s verification complete; no orders submitted", environment)
             return
@@ -88,6 +101,8 @@ def run(config: GridConfig | None = None, journal: TradeJournal | None = None) -
         finally:
             restore_signal_handlers(previous_handlers)
         return
+    else:
+        exchange = PaperExchange()
     strategy = StaticNeutralGrid(config)
     store = StateStore(config.state_file)
     risk = RoiRiskManager(config, store.load_risk_state())

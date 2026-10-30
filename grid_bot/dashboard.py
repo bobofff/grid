@@ -8,7 +8,9 @@ from __future__ import annotations
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
+import logging
 import os
+import re
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -23,6 +25,7 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from .config import GridConfig, STRATEGY_CONFIG_KEYS, StrategyConfigNotInitialized
+from .email_notifier import EmailNotifier
 from .exchange import BinanceUsdmExchange, BinanceApiError
 from .journal import TradeJournal
 from .state import RunnerState, StateStore, load_runner_state, save_runner_state
@@ -37,12 +40,39 @@ BINANCE_MAINNET_PUBLIC_URL = "https://fapi.binance.com"
 STATUS_CACHE_SECONDS = 120
 _status_cache_lock = Lock()
 _status_cache: tuple[float, dict[str, Any]] | None = None
+_notifier_lock = Lock()
+_notifiers_by_state_file: dict[str, EmailNotifier] = {}
 EDITABLE_FIELDS = {
     "SYMBOL", "GRID_LOWER_PRICE", "GRID_UPPER_PRICE", "GRID_COUNT", "GRID_SPACING",
     "LEVERAGE", "START_REFERENCE_PRICE", "INITIAL_CAPITAL_USDT",
     "HARD_STOP_LOSS_ROI", "BREAKEVEN_ARM_ROI", "BREAKEVEN_FLOOR_ROI", "TRAILING_ARM_ROI",
     "TRAILING_DRAWDOWN_ROI", "LOOP_INTERVAL_SECONDS",
 }
+
+
+def _safe_error_detail(error: Exception) -> str:
+    return re.sub(r"(?i)(signature=)[^&\s]+", r"\1<redacted>", str(error))[:1000]
+
+
+def _binance_error_dedupe_key(error: Exception) -> str:
+    return f"dashboard-binance:{type(error).__name__}:{int(time.time() // 900)}"
+
+
+def _notify_operational_error(config: GridConfig, subject: str, error: Exception,
+                              *, dedupe_key: str | None = None) -> None:
+    try:
+        # Dashboard handlers are short-lived request threads.  Reusing the notifier
+        # keeps one persistent dispatcher per strategy state instead of leaking a
+        # daemon worker thread for every operational error.
+        with _notifier_lock:
+            notifier = _notifiers_by_state_file.get(config.state_file)
+            if notifier is None:
+                notifier = EmailNotifier(config, journal=TradeJournal.for_state_file(config.state_file))
+                _notifiers_by_state_file[config.state_file] = notifier
+        notifier.notify(subject, f"错误类型：{type(error).__name__}\n详情：{_safe_error_detail(error)}",
+                        dedupe_key=dedupe_key)
+    except Exception:
+        logging.exception("Could not queue dashboard operational email")
 
 
 def launch_runner() -> str:
@@ -60,17 +90,28 @@ def start_new_grid() -> dict[str, Any]:
     if config.execution_mode not in {"binance_testnet", "binance_mainnet"} or config.dry_run or not config.runner_enabled:
         raise ValueError("请启用 Binance 合约模式、DRY_RUN=false 和 RUNNER_ENABLED=true 后再启动")
 
-    exchange = BinanceUsdmExchange(config)
-    exchange.verify_account()
-    exchange.assert_clean_symbol()
-    exchange.assert_starting_capital_available()
+    try:
+        exchange = BinanceUsdmExchange(config)
+        exchange.verify_account()
+        exchange.assert_clean_symbol()
+        exchange.assert_starting_capital_available()
+    except Exception as error:
+        _notify_operational_error(
+            config, f"Grid Binance 启动校验异常 - {config.symbol}", error,
+            dedupe_key=_binance_error_dedupe_key(error),
+        )
+        raise
 
     # A faulted PM2 instance can still be inside an exponential-restart window.
     # Stop it before replacing state, otherwise its stale in-memory runner can
     # overwrite the new NEW phase and turn a fresh grid into an empty resume.
-    status = pm2_status()
-    if status["known"] and status["status"] == "online":
-        pm2_action("stop")
+    try:
+        status = pm2_status()
+        if status["known"] and status["status"] == "online":
+            pm2_action("stop")
+    except Exception as error:
+        _notify_operational_error(config, f"Grid 旧进程停止失败 - {config.symbol}", error)
+        raise
 
     store = StateStore(config.state_file)
     if store.path.exists():
@@ -80,29 +121,50 @@ def start_new_grid() -> dict[str, Any]:
 
     # Refresh the reference immediately before spawning so page-refresh latency
     # cannot make a freshly saved grid fail its startup drift check.
-    mark_price = exchange.mark_price()
+    try:
+        mark_price = exchange.mark_price()
+    except Exception as error:
+        _notify_operational_error(
+            config, f"Grid Binance 启动行情读取异常 - {config.symbol}", error,
+            dedupe_key=_binance_error_dedupe_key(error),
+        )
+        raise
     write_strategy_config(config.state_file, {"START_REFERENCE_PRICE": str(mark_price)})
     config = GridConfig.from_env(str(ENV_FILE))
     run_id = uuid4().hex[:12]
     journal = TradeJournal.for_state_file(config.state_file)
     journal.create_grid_run(run_id, public_config(config))
     save_runner_state(store, RunnerState(grid_run_id=run_id))
-    return {"mark_price": mark_price, "run_id": run_id, "message": launch_runner()}
+    try:
+        message = launch_runner()
+    except Exception as error:
+        _notify_operational_error(config, f"Grid 策略启动失败 - {config.symbol}", error)
+        raise
+    return {"mark_price": mark_price, "run_id": run_id, "message": message}
 
 
 def resume_grid() -> dict[str, Any]:
     """Restart a paused runner without changing its persisted grid legs."""
-    status = pm2_status()
+    config = GridConfig.from_env(str(ENV_FILE))
+    try:
+        status = pm2_status()
+    except Exception as error:
+        _notify_operational_error(config, f"Grid PM2 状态读取失败 - {config.symbol}", error)
+        raise
     if status["known"] and status["status"] == "online":
         raise ValueError("策略已经在运行；无需重启")
-    config = GridConfig.from_env(str(ENV_FILE))
     store = StateStore(config.state_file)
     if not store.path.exists():
         raise ValueError("没有可恢复的网格状态；请使用“保存并启动网格”创建新网格")
     state = load_runner_state(store)
     if not state.orders:
         raise ValueError("当前状态没有可恢复的网格订单；请使用“保存并启动网格”创建新网格")
-    return {"message": launch_runner(), "tracked_orders": len(state.orders)}
+    try:
+        message = launch_runner()
+    except Exception as error:
+        _notify_operational_error(config, f"Grid 策略重启失败 - {config.symbol}", error)
+        raise
+    return {"message": message, "tracked_orders": len(state.orders)}
 
 
 def exit_grid() -> dict[str, Any]:
@@ -115,32 +177,42 @@ def exit_grid() -> dict[str, Any]:
     config = GridConfig.from_env(str(ENV_FILE))
     if config.execution_mode not in {"binance_testnet", "binance_mainnet"} or config.dry_run:
         raise ValueError("一键平仓仅适用于已启用的 Binance 合约策略")
-    status = pm2_status()
-    if not status["known"]:
-        raise ValueError("未找到 PM2 管理的 grid-bot；为避免与未知进程竞争，已拒绝平仓")
-    if status["status"] == "online":
-        pm2_action("stop")
-    stopped = pm2_status()
-    if stopped["status"] == "online":
-        raise ValueError("策略尚未停止；为避免平仓时重新挂单，操作已中止")
+    notifier = EmailNotifier(config, journal=TradeJournal.for_state_file(config.state_file))
+    try:
+        status = pm2_status()
+        if not status["known"]:
+            raise ValueError("未找到 PM2 管理的 grid-bot；为避免与未知进程竞争，已拒绝平仓")
+        if status["status"] == "online":
+            pm2_action("stop")
+        stopped = pm2_status()
+        if stopped["status"] == "online":
+            raise ValueError("策略尚未停止；为避免平仓时重新挂单，操作已中止")
 
-    exchange = BinanceUsdmExchange(config)
-    exchange.verify_account()
-    exchange.cancel_all(config.symbol)
-    exchange.close_all_positions(config.symbol)
-    exchange.assert_clean_symbol()
+        exchange = BinanceUsdmExchange(config)
+        exchange.verify_account()
+        exchange.cancel_all(config.symbol)
+        exchange.close_all_positions(config.symbol)
+        exchange.assert_clean_symbol()
 
-    store = StateStore(config.state_file)
-    state = load_runner_state(store)
-    state.orders.clear()
-    state.deferred_orders.clear()
-    state.approved_expired_order_ids.clear()
-    state.phase = "STOPPED:MANUAL_CLOSE"
-    save_runner_state(store, state)
-    TradeJournal.for_state_file(config.state_file).record_runner_event(
-        "MANUAL_EXIT_COMPLETED", reason="OPERATOR_REQUEST",
-        detail=f"{config.symbol}: orders cancelled and positions flattened",
-    )
+        store = StateStore(config.state_file)
+        state = load_runner_state(store)
+        state.orders.clear()
+        state.deferred_orders.clear()
+        state.approved_expired_order_ids.clear()
+        state.phase = "STOPPED:MANUAL_CLOSE"
+        save_runner_state(store, state)
+        TradeJournal.for_state_file(config.state_file).record_runner_event(
+            "MANUAL_EXIT_COMPLETED", reason="OPERATOR_REQUEST",
+            detail=f"{config.symbol}: orders cancelled and positions flattened",
+        )
+    except Exception as error:
+        _notify_operational_error(
+            config, f"Grid 手动停止/平仓失败 - {config.symbol}", error,
+            dedupe_key=_binance_error_dedupe_key(error) if isinstance(error, BinanceApiError) else None,
+        )
+        raise
+    notifier.notify(f"Grid 机器人已停止 - {config.symbol}",
+                    f"手动退出已完成；交易所挂单已撤销、持仓已平仓。\n策略状态：STOPPED:MANUAL_CLOSE")
     return {"message": f"{config.symbol} 已撤销全部挂单并平仓；策略已停止", "status": stopped}
 
 
@@ -505,7 +577,11 @@ def status_snapshot() -> dict[str, Any]:
             state = load_runner_state(StateStore(config.state_file))
             try:
                 pm2 = pm2_status()
-            except ValueError:
+            except ValueError as error:
+                _notify_operational_error(
+                    config, f"Grid PM2 状态读取异常 - {config.symbol}", error,
+                    dedupe_key=f"dashboard-pm2-status:{int(time.time() // 900)}",
+                )
                 pm2 = {"known": False, "status": "unavailable", "pid": None, "restarts": 0}
             started_at = performance_started_at(config, state)
             income = exchange.income_history(int(started_at.timestamp() * 1000)) if started_at and state.baseline_account_equity is not None else []
@@ -580,7 +656,20 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json(runner_console())
                 return
             if path == "/api/pm2":
-                self._json(pm2_status())
+                try:
+                    status = pm2_status()
+                except ValueError as error:
+                    try:
+                        config = GridConfig.from_env(str(ENV_FILE))
+                    except Exception:
+                        config = None
+                    if config is not None:
+                        _notify_operational_error(
+                            config, f"Grid PM2 状态读取失败 - {config.symbol}", error,
+                            dedupe_key=f"dashboard-pm2-read:{int(time.time() // 900)}",
+                        )
+                    raise
+                self._json(status)
                 return
             if path == "/api/grid-runs":
                 config, _ = self._config_and_preview()
@@ -607,6 +696,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 return
             return super().do_GET()
         except (ValueError, BinanceApiError) as error:
+            if isinstance(error, BinanceApiError):
+                try:
+                    config = GridConfig.from_env(str(ENV_FILE))
+                except Exception:
+                    config = None
+                if config is not None:
+                    _notify_operational_error(
+                        config, f"Grid Binance 接口异常 - {config.symbol}", error,
+                        dedupe_key=f"dashboard-binance:{type(error).__name__}:{int(time.time() // 900)}",
+                    )
             self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -620,7 +719,20 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             if not isinstance(data, dict) or not data:
                 raise ValueError("Expected a JSON object")
             if path == "/api/pm2":
-                self._json(pm2_action(str(data.get("action", ""))))
+                try:
+                    status = pm2_action(str(data.get("action", "")))
+                except ValueError as error:
+                    try:
+                        config = GridConfig.from_env(str(ENV_FILE))
+                    except Exception:
+                        config = None
+                    if config is not None:
+                        _notify_operational_error(
+                            config, f"Grid PM2 操作失败 - {config.symbol}", error,
+                            dedupe_key=f"dashboard-pm2-action:{int(time.time() // 900)}",
+                        )
+                    raise
+                self._json(status)
                 return
             if path == "/api/restart":
                 self._json(resume_grid())
@@ -660,7 +772,17 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             _, response = self._config_and_preview()
             response["funding"] = plan if provisional.execution_mode in {"binance_testnet", "binance_mainnet"} else None
             self._json(response)
-        except (ValueError, json.JSONDecodeError) as error:
+        except (ValueError, BinanceApiError, json.JSONDecodeError) as error:
+            if isinstance(error, BinanceApiError):
+                try:
+                    config = GridConfig.from_env(str(ENV_FILE))
+                except Exception:
+                    config = None
+                if config is not None:
+                    _notify_operational_error(
+                        config, f"Grid Binance 接口异常 - {config.symbol}", error,
+                        dedupe_key=f"dashboard-binance:{type(error).__name__}:{int(time.time() // 900)}",
+                    )
             self._json({"error": str(error)}, HTTPStatus.BAD_REQUEST)
 
 

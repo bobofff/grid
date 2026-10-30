@@ -12,12 +12,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
+import re
 from queue import Empty, Queue
 import signal
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 import time
 import traceback
 from typing import Any
@@ -26,6 +27,7 @@ from uuid import uuid4
 import websocket
 
 from .config import GridConfig
+from .email_notifier import EmailNotifier
 from .exchange import (
     BinanceApiError,
     BinanceRateLimitError,
@@ -80,6 +82,15 @@ class BinanceUserStream:
         # is unable to observe.
         self.connected = Event()
         self._app: Any = None
+        self._error_reported = False
+
+    def _report_error(self, source: str, error: Any) -> None:
+        if self._error_reported:
+            return
+        self._error_reported = True
+        self.events.put({RUNNER_ERROR_EVENT_KEY: {
+            "source": source, "detail": str(error),
+        }})
 
     def start(self) -> None:
         self.listen_key = self.exchange.create_listen_key()
@@ -108,12 +119,14 @@ class BinanceUserStream:
         while not self.stop_event.wait(self.refresh_seconds):
             try:
                 self.exchange.keepalive_listen_key()
-            except Exception:
+            except Exception as error:
                 logging.exception("Failed to refresh the Binance listen key; requesting a new one")
+                self._report_error("LISTEN_KEY", error)
                 try:
                     self.listen_key = self.exchange.create_listen_key()
-                except Exception:
+                except Exception as replacement_error:
                     logging.exception("Failed to obtain a replacement Binance listen key")
+                    self._report_error("LISTEN_KEY", replacement_error)
 
     def _run(self) -> None:
         def on_message(_: Any, message: str) -> None:
@@ -127,10 +140,12 @@ class BinanceUserStream:
 
         def on_open(_: Any) -> None:
             logging.info("User stream connected")
+            self._error_reported = False
             self.connected.set()
 
         def on_error(_: Any, error: Any) -> None:
             logging.warning("User stream error: %s", error)
+            self._report_error("WEBSOCKET", error)
 
         while not self.stop_event.is_set():
             listen_key = self.listen_key
@@ -141,11 +156,16 @@ class BinanceUserStream:
                                          on_message=on_message, on_error=on_error,
                                          on_open=on_open)
             self._app = app
-            app.run_forever(ping_interval=30, ping_timeout=10)
+            try:
+                app.run_forever(ping_interval=30, ping_timeout=10)
+            except Exception as error:
+                logging.exception("Binance user stream worker failed")
+                self._report_error("WEBSOCKET", error)
             # The socket is gone, so nothing is observable until it comes back.
             self.connected.clear()
             self._app = None
             if not self.stop_event.is_set():
+                self._report_error("WEBSOCKET", "User-data WebSocket disconnected")
                 self.stop_event.wait(self.RECONNECT_DELAY_SECONDS)
 
     def stop(self) -> None:
@@ -160,6 +180,7 @@ class BinanceUserStream:
 
 
 SHUTDOWN_SIGNALS: tuple[int, ...] = (signal.SIGTERM, signal.SIGHUP)
+RUNNER_ERROR_EVENT_KEY = "_grid_runner_error"
 
 
 def install_signal_handlers(runner: "GridRunner",
@@ -218,9 +239,122 @@ class GridRunner:
         self.stop_signal: str | None = None
         self._stream_reconcile_needed = False
         self._next_periodic_reconcile_at = time.monotonic() + self.PERIODIC_RECONCILE_INTERVAL_SECONDS
+        self.notifier = EmailNotifier(config, journal=self.journal)
+        self._summary_lock = Lock()
+        self._summary_pending = False
+        self._summary_thread: Thread | None = None
+        self._summary_due_at = self._load_summary_due()
 
     def _save(self) -> None:
         save_runner_state(self.store, self.state)
+
+    @staticmethod
+    def _safe_error_detail(detail: Any) -> str:
+        text = re.sub(r"(?i)(signature=)[^&\s]+", r"\1<redacted>", str(detail))
+        return text[:1000]
+
+    def _notify(self, subject: str, body: str, *, dedupe_key: str | None = None,
+                cooldown_seconds: float = 0) -> bool:
+        return self.notifier.notify(subject, body, dedupe_key=dedupe_key,
+                                   cooldown_seconds=cooldown_seconds)
+
+    def _notification_run_key(self) -> str:
+        if self.state.grid_run_id:
+            return self.state.grid_run_id
+        if self.state.baseline_started_at:
+            return f"legacy-{self.state.baseline_started_at}"
+        return f"legacy-{self.config.symbol}"
+
+    def _notify_first_fill(self, order: GridOrder, *, source: str) -> None:
+        if not self.notifier.enabled:
+            return
+        run_id = self._notification_run_key()
+        self._notify(
+            f"Grid 首次真实成交 - {self.config.symbol}",
+            f"首次成交已由 Binance 确认。\n交易对：{self.config.symbol}\n"
+            f"方向/用途：{order.side.value} / {order.purpose.value}\n"
+            f"价格：{order.price}\n订单编号：{order.client_order_id}\n"
+            f"确认来源：{source}\n运行编号：{run_id}",
+            dedupe_key=f"first-fill:{run_id}",
+        )
+
+    def _load_summary_due(self) -> datetime | None:
+        run_key = self._notification_run_key()
+        previous = self.journal.latest_runner_event_at("EMAIL_SUMMARY_QUEUED", reason=run_key)
+        if previous is None and self.state.baseline_started_at:
+            try:
+                previous = datetime.fromisoformat(self.state.baseline_started_at)
+            except ValueError:
+                previous = None
+        previous = previous or self.journal.latest_runner_event_at("RUNNING")
+        return previous + timedelta(hours=6) if previous is not None else None
+
+    def _maybe_send_summary(self) -> None:
+        if not self.notifier.enabled or self.state.phase != "RUNNING":
+            return
+        now = datetime.now(timezone.utc)
+        run_key = self._notification_run_key()
+        with self._summary_lock:
+            due_at = self._summary_due_at
+            if due_at is None or now < due_at or self._summary_pending:
+                return
+            self._summary_pending = True
+        self._summary_thread = Thread(
+            target=self._send_summary, args=(now, run_key, due_at),
+            daemon=True, name="grid-email-summary",
+        )
+        self._summary_thread.start()
+
+    def _send_summary(self, now: datetime, run_key: str, due_at: datetime) -> None:
+        summary_queued = False
+        try:
+            if self.state.phase != "RUNNING":
+                return
+            equity_text, profit_text = "暂不可用", "暂不可用"
+            positions_text = "暂不可用"
+            try:
+                equity = self.exchange.equity_snapshot().equity(self.config.initial_capital_usdt)
+                baseline = self.state.baseline_account_equity
+                equity_text = f"{equity:.8f} USDT"
+                profit_text = f"{equity - baseline:+.8f} USDT" if baseline is not None else "基线缺失"
+                positions = self.exchange.positions()
+                positions_text = "无持仓" if not positions else "\n".join(
+                    f"{item.get('positionSide', '?')}: 数量 {item.get('positionAmt', '?')}，"
+                    f"入场价 {item.get('entryPrice', '?')}，未实现盈亏 {item.get('unRealizedProfit', '?')} USDT"
+                    for item in positions
+                )
+            except Exception as error:
+                detail = self._safe_error_detail(error)
+                self.journal.record_runner_event("SUMMARY_SNAPSHOT_FAILED", reason=type(error).__name__,
+                                                 detail=detail)
+                self._notify("Grid 汇总数据读取异常", f"{self.config.symbol}：{detail}",
+                             dedupe_key=f"summary-snapshot:{type(error).__name__}",
+                             cooldown_seconds=900)
+            if self.state.phase != "RUNNING":
+                return
+            status = "运行中" if not self.stopped else self.state.phase
+            error_count = self.journal.runner_error_count()
+            body = (
+                f"交易对：{self.config.symbol}\n运行状态：{status}（{self.state.phase}）\n"
+                f"账户权益：{equity_text}\n策略累计收益：{profit_text}\n"
+                f"当前持仓：{positions_text}\n异常次数：{error_count}\n"
+                f"运行编号：{run_key}\n统计时间：{now.isoformat(timespec='seconds')}"
+            )
+            period_key = int(due_at.timestamp())
+            notification_key = f"summary:{run_key}:{period_key}"
+            enqueued = self._notify(f"Grid 6 小时运行汇总 - {self.config.symbol}", body,
+                                    dedupe_key=notification_key)
+            if enqueued or self.journal.email_notification_exists(notification_key):
+                self.journal.record_runner_event("EMAIL_SUMMARY_QUEUED", reason=run_key,
+                                                 detail=now.isoformat())
+                summary_queued = True
+        except Exception:
+            logging.exception("Failed to build the six-hour email summary")
+        finally:
+            with self._summary_lock:
+                if summary_queued:
+                    self._summary_due_at = now + timedelta(hours=6)
+                self._summary_pending = False
 
     def _run_config_snapshot(self) -> dict[str, Any]:
         """Persist only display-safe configuration alongside an audit run."""
@@ -255,11 +389,24 @@ class GridRunner:
             # The POST may have been accepted even though its response never arrived.
             # Ask by client ID before declaring the leg unplaced, or the grid would be
             # left short while an orphan order sits on the exchange.
-            landed = self._confirm_after_failed_submit(order)
+            confirmed_status = self._confirm_after_failed_submit(order)
+            landed = confirmed_status in {"NEW", "PARTIALLY_FILLED", "FILLED"}
             self.journal.record_order("SUBMIT_FAILED", order, symbol=self.config.symbol,
                                       grid_run_id=self.state.grid_run_id,
-                                      detail={"error": repr(error), "reached_binance": landed})
+                                      detail={"error": self._safe_error_detail(error),
+                                              "reached_binance": confirmed_status is not None,
+                                              "exchange_status": confirmed_status})
             if not landed:
+                detail = self._safe_error_detail(error)
+                self.journal.record_runner_event("ORDER_SUBMIT_FAILED", reason=type(error).__name__,
+                                                 detail=detail)
+                self._notify(
+                    f"Grid 下单失败 - {self.config.symbol}",
+                    f"订单未能由 Binance 确认成功。\n订单：{order.client_order_id}\n"
+                    f"方向/用途：{order.side.value} / {order.purpose.value}\n"
+                    f"交易所查询状态：{confirmed_status or '未查询到'}\n错误：{detail}",
+                    dedupe_key=f"submit-failed:{order.client_order_id}",
+                )
                 raise
             logging.warning("Order %s was accepted despite a failed response; keeping the leg",
                             order.client_order_id)
@@ -268,13 +415,13 @@ class GridRunner:
                                   symbol=self.config.symbol, grid_run_id=self.state.grid_run_id)
         return True
 
-    def _confirm_after_failed_submit(self, order: GridOrder) -> bool:
+    def _confirm_after_failed_submit(self, order: GridOrder) -> str | None:
         try:
-            return self.exchange.order_status(order.client_order_id) is not None
+            return self.exchange.order_status(order.client_order_id)
         except Exception:
             logging.warning("Could not confirm whether %s reached Binance",
                             order.client_order_id, exc_info=True)
-            return False
+            return None
 
     @staticmethod
     def _is_close(order: GridOrder) -> bool:
@@ -354,6 +501,11 @@ class GridRunner:
         self.state.phase = f"EXITING:{reason.value}"
         self._save()
         self.journal.record_runner_event("EXIT_STARTED", reason=reason.value)
+        self._notify(
+            f"Grid 风控退出触发 - {self.config.symbol}",
+            f"触发条件：{reason.value}\n策略已开始撤单和平仓流程。\n运行编号：{self.state.grid_run_id or '未知'}",
+            dedupe_key=f"risk-exit:{self.state.grid_run_id}:{reason.value}",
+        )
         logging.warning("Risk exit %s: cancelling orders then closing positions", reason.value)
         failures: list[Exception] = []
         for action, operation in (("CANCEL_ALL", self.exchange.cancel_all),
@@ -368,8 +520,11 @@ class GridRunner:
         if failures:
             self.state.phase = f"STOPPED:{reason.value}:INCOMPLETE"
             self._save()
-            self.journal.record_runner_event("EXIT_INCOMPLETE", reason=reason.value,
-                                             detail=repr(failures[0]))
+            detail = self._safe_error_detail(failures[0])
+            self.journal.record_runner_event("EXIT_INCOMPLETE", reason=reason.value, detail=detail)
+            self._notify(f"Grid 风控退出未完成 - {self.config.symbol}",
+                         f"原因：{reason.value}\n错误：{detail}\n需要人工检查撤单/平仓状态。",
+                         dedupe_key=f"risk-exit-incomplete:{self.state.grid_run_id}:{reason.value}")
             raise failures[0]
         self.state.orders.clear()
         self.state.deferred_orders.clear()
@@ -384,7 +539,13 @@ class GridRunner:
         self.stopped = True
         self.state.phase = f"PAUSED:{reason}"
         self._save()
-        self.journal.record_runner_event("FAULT_PAUSED", reason=reason, detail=detail)
+        safe_detail = self._safe_error_detail(detail) if detail else ""
+        self.journal.record_runner_event("FAULT_PAUSED", reason=reason, detail=safe_detail)
+        self._notify(
+            f"Grid 机器人已停止/暂停 - {self.config.symbol}",
+            f"原因：{reason}\n详情：{safe_detail or '无'}\n当前状态：{self.state.phase}\n"
+            f"交易所挂单和仓位已保留，未自动撤单或平仓。\n运行编号：{self.state.grid_run_id or '未知'}",
+        )
         logging.warning("Runner paused for recoverable fault %s; preserving Binance orders and positions",
                         reason)
 
@@ -449,6 +610,7 @@ class GridRunner:
                 self.journal.record_order("ORDER_FILLED", order, symbol=self.config.symbol,
                                           grid_run_id=self.state.grid_run_id,
                                           detail={"source": "reconciliation"})
+                self._notify_first_fill(order, source="Binance REST 对账")
                 del self.state.orders[client_order_id]
                 self._save()
                 self._defer_replacement(self.strategy.on_fill(order))
@@ -490,13 +652,27 @@ class GridRunner:
         self._release_deferred_orders()
 
     def _handle_event(self, event: dict[str, Any]) -> None:
+        stream_error = event.get(RUNNER_ERROR_EVENT_KEY)
+        if isinstance(stream_error, dict):
+            source = str(stream_error.get("source", "WEBSOCKET"))
+            source_label = {"WEBSOCKET": "WebSocket", "LISTEN_KEY": "监听密钥"}.get(source, source)
+            detail = self._safe_error_detail(stream_error.get("detail", "Unknown stream error"))
+            self.journal.record_runner_event("WEBSOCKET_ERROR", reason=source, detail=detail)
+            self._notify(f"Grid Binance {source_label} 异常 - {self.config.symbol}",
+                         f"来源：{source}\n详情：{detail}\n策略状态：{self.state.phase}",
+                         dedupe_key=f"stream-error:{source}", cooldown_seconds=900)
+            return
         try:
             update = parse_order_update(event)
         except MalformedOrderEvent:
             # A damaged frame is not a reason to flatten the account. Journal it and
             # let the next restart's reconciliation repair any leg we did not observe.
+            detail = self._safe_error_detail(traceback.format_exc())
             self.journal.record_runner_event("ORDER_EVENT_UNPARSEABLE", reason="MALFORMED_EVENT",
-                                             detail=traceback.format_exc())
+                                             detail=detail)
+            self._notify(f"Grid Binance WebSocket 订单事件异常 - {self.config.symbol}",
+                         f"无法解析交易所订单事件：{detail}",
+                         dedupe_key="malformed-order-event", cooldown_seconds=900)
             logging.exception("Ignoring a malformed user-stream order event")
             return
         if not update or update.symbol != self.config.symbol:
@@ -507,6 +683,7 @@ class GridRunner:
             return
         if update.status == "FILLED":
             order = decode_order(encoded)
+            self._notify_first_fill(order, source="Binance ORDER_TRADE_UPDATE")
             del self.state.orders[update.client_order_id]
             self._save()
             self._defer_replacement(self.strategy.on_fill(order))
@@ -584,6 +761,14 @@ class GridRunner:
         self._drain_events()
         self._release_deferred_orders()
         self.journal.record_runner_event("RUNNING")
+        self._summary_due_at = self._load_summary_due()
+        if self.state.phase == "RUNNING" and not self.stopped:
+            self._notify(
+                f"Grid 策略启动成功 - {self.config.symbol}",
+                f"策略已通过 Binance 账户校验并进入运行状态。\n"
+                f"执行模式：{self.config.execution_mode}\n运行编号：{self.state.grid_run_id or '未知'}\n"
+                f"当前追踪订单：{len(self.state.orders)}",
+            )
 
     def _drain_events(self) -> int:
         """Consume every queued event before doing any blocking account work.
@@ -618,8 +803,12 @@ class GridRunner:
         except (BinanceTransportError, BinanceTimestampError) as error:
             # Preserve the live runner after a temporary REST failure; the next
             # bounded periodic check will retry without request amplification.
+            detail = self._safe_error_detail(error)
             self.journal.record_runner_event("PERIODIC_RECONCILE_RETRY",
-                                             reason=type(error).__name__, detail=repr(error))
+                                             reason=type(error).__name__, detail=detail)
+            self._notify(f"Grid Binance 对账异常 - {self.config.symbol}", detail,
+                         dedupe_key=f"binance-reconcile:{type(error).__name__}",
+                         cooldown_seconds=900)
             logging.warning("Periodic Binance reconciliation unavailable; will retry: %s", error)
 
     def run_forever(self) -> None:
@@ -645,13 +834,17 @@ class GridRunner:
                     # runner and user stream alive after a transient TLS outage so
                     # a single failed account poll cannot abandon open grid orders.
                     reason = "CLOCK_SYNC_ERROR" if isinstance(error, BinanceTimestampError) else "TRANSPORT_ERROR"
+                    detail = self._safe_error_detail(error)
                     self.journal.record_runner_event("ACCOUNT_SNAPSHOT_RETRY",
-                                                     reason=reason, detail=repr(error))
+                                                     reason=reason, detail=detail)
+                    self._notify(f"Grid Binance 账户快照异常 - {self.config.symbol}", detail,
+                                 dedupe_key=f"account-snapshot:{reason}", cooldown_seconds=900)
                     logging.warning("Account snapshot unavailable; will retry: %s", error)
                     continue
                 roi, reason = manager.evaluate(equity)
                 self.state.peak_roi = manager.state.peak_roi
                 self._save()
+                self._maybe_send_summary()
                 if reason is not ExitReason.NONE:
                     logging.warning("ROI %.2f%% triggered %s", roi * 100, reason.value)
                     self._risk_exit(reason)
@@ -659,6 +852,9 @@ class GridRunner:
                     if not self._stream_reconcile_needed:
                         self.journal.record_runner_event("STREAM_DISCONNECTED",
                                                          reason="USER_STREAM_UNAVAILABLE")
+                        self._notify(f"Grid Binance WebSocket 已断开 - {self.config.symbol}",
+                                     "用户数据流已断开；策略暂停提交新订单，等待重连后对账。",
+                                     dedupe_key="stream-error:WEBSOCKET", cooldown_seconds=900)
                         self._stream_reconcile_needed = True
                     continue
                 if self._stream_reconcile_needed:
@@ -680,7 +876,7 @@ class GridRunner:
             self.journal.record_runner_event("INTERRUPTED", reason="KEYBOARD_INTERRUPT")
             self._fault_exit("KEYBOARD_INTERRUPT")
         except BinanceRateLimitError as error:
-            detail = repr(error)
+            detail = self._safe_error_detail(error)
             if error.retry_at_ms is not None:
                 detail = f"{detail}; retry_at_ms={error.retry_at_ms}"
             logging.error("Binance rate limit reached; pausing instead of restarting: %s", detail)
@@ -690,13 +886,15 @@ class GridRunner:
             return
         except BinanceTimestampError as error:
             logging.error("Binance clock synchronization failed during startup; pausing: %s", error)
-            self._fault_exit("CLOCK_SYNC_FAILED", detail=repr(error))
+            self._fault_exit("CLOCK_SYNC_FAILED", detail=self._safe_error_detail(error))
             return
-        except Exception:
-            self.journal.record_runner_event("RUNNER_EXCEPTION", reason="UNHANDLED_EXCEPTION",
-                                             detail=traceback.format_exc())
+        except Exception as error:
+            trace = self._safe_error_detail(traceback.format_exc())
+            self.journal.record_runner_event("RUNNER_EXCEPTION", reason=type(error).__name__,
+                                             detail=trace)
             logging.exception("Runner failed; preserving exchange state for reconciliation")
-            self._fault_exit("UNHANDLED_EXCEPTION")
+            self._fault_exit("UNHANDLED_EXCEPTION", detail=self._safe_error_detail(error))
             raise
         finally:
             self.stream.stop()
+            self.notifier.flush(timeout=12)

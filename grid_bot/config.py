@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import os
 
@@ -72,6 +72,12 @@ class GridConfig:
     binance_hedge_mode_required: bool
     runner_enabled: bool
     live_trading_confirmation: str
+    email_enabled: bool = False
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_app_password: str = field(default="", repr=False)
+    email_to: str = ""
 
     @classmethod
     def from_env(cls, path: str = ".env", *, prefer_file: bool = True,
@@ -82,6 +88,9 @@ class GridConfig:
         the state sidecar database. Every later load ignores their .env copies.
         """
         load_dotenv(path, override=prefer_file)
+        email_enabled_value = os.getenv("EMAIL_ENABLED", "false").strip().lower()
+        if email_enabled_value not in {"true", "false"}:
+            raise ValueError("EMAIL_ENABLED must be true or false")
         state_file = _required("STATE_FILE")
         journal = TradeJournal.for_state_file(state_file)
         strategy_values = journal.strategy_config()
@@ -131,6 +140,12 @@ class GridConfig:
             binance_hedge_mode_required=_required("BINANCE_HEDGE_MODE_REQUIRED").lower() == "true",
             runner_enabled=_required("RUNNER_ENABLED").lower() == "true",
             live_trading_confirmation=os.getenv("LIVE_TRADING_CONFIRMATION", ""),
+            email_enabled=email_enabled_value == "true",
+            smtp_host=os.getenv("SMTP_HOST", "smtp.gmail.com"),
+            smtp_port=int(os.getenv("SMTP_PORT", "587")),
+            smtp_username=os.getenv("SMTP_USERNAME", ""),
+            smtp_app_password=os.getenv("SMTP_APP_PASSWORD", ""),
+            email_to=os.getenv("EMAIL_TO", ""),
         )
         config.validate()
         return config
@@ -156,6 +171,17 @@ class GridConfig:
             raise ValueError("EXECUTION_MODE=binance_testnet requires BINANCE_TESTNET=true")
         if self.execution_mode == "binance_mainnet" and self.binance_testnet:
             raise ValueError("EXECUTION_MODE=binance_mainnet requires BINANCE_TESTNET=false")
+        if not 1 <= self.smtp_port <= 65535:
+            raise ValueError("SMTP_PORT must be between 1 and 65535")
+        if self.email_enabled:
+            missing_email_settings = [name for name, value in (
+                ("SMTP_HOST", self.smtp_host), ("SMTP_USERNAME", self.smtp_username),
+                ("SMTP_APP_PASSWORD", self.smtp_app_password), ("EMAIL_TO", self.email_to),
+            ) if not value]
+            if missing_email_settings:
+                raise ValueError(
+                    "Email notifications are enabled but missing: " + ", ".join(missing_email_settings)
+                )
         if (self.execution_mode == "binance_mainnet" and not self.dry_run
                 and self.live_trading_confirmation != "I_UNDERSTAND_LIVE_TRADING"):
             raise ValueError(
